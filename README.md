@@ -182,16 +182,6 @@ nvcc -O2 -o facaded_rnn_cuda facaded_rnn.cu
 
 ---
 
-## Overview & Notes
-
-- **No icons or branding**—Clean documentation and open source code only.
-- Both "bare" and "facade" APIs share major features; facaded_rnn.cu is more extensible and easier for prototyping or research.
-- All model weights are accessible (for saving/loading/introspection) via API or file.
-- Backward computation may mix CPU and GPU kernels for clarity and flexibility.
-- Full documentation is in code comments for expected input/output formats and for extending with new cells/losses.
-
----
-
 ## License
 
 MIT License, Copyright © 2025 Matthew Abbott
