@@ -1,7 +1,6 @@
 //
 // Matthew Abbott  2025
 // Advanced RNN with BPTT, Gradient Clipping, LSTM/GRU, Batch Processing
-// OpenCL port from CUDA
 //
 #define CL_TARGET_OPENCL_VERSION 120
 #ifdef __APPLE__
