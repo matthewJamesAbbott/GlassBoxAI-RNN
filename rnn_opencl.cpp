@@ -207,22 +207,16 @@ public:
         clEnqueueReadBuffer(queue, d_ptr, CL_TRUE, 0, size * sizeof(float), dst.data(), 0, NULL, NULL);
     }
 
-    void zero() {
-        if (d_ptr && size > 0) {
-            size_t globalSize = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            cl_kernel k_zero_kernel;
-            cl_int err;
-            k_zero_kernel = clCreateKernel(
-                clCreateProgramWithSource(context, 1, &kernelSource, NULL, &err), "k_zero", &err);
-            CL_CHECK(err);
-            clSetKernelArg(k_zero_kernel, 0, sizeof(cl_mem), &d_ptr);
-            clSetKernelArg(k_zero_kernel, 1, sizeof(int), &size);
-            err = clEnqueueNDRangeKernel(queue, k_zero_kernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
-            CL_CHECK(err);
-            clReleaseKernel(k_zero_kernel);
-        }
+void zero(cl_kernel k_zero_kernel) {
+    if (d_ptr && size > 0) {
+        size_t globalSize = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+        clSetKernelArg(k_zero_kernel, 0, sizeof(cl_mem), &d_ptr);
+        clSetKernelArg(k_zero_kernel, 1, sizeof(int), &size);
+        cl_int err = clEnqueueNDRangeKernel(queue, k_zero_kernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+        CL_CHECK(err);
+        clFinish(queue);
     }
-
+}
     ~CLArray() { free(); }
 };
 
@@ -508,9 +502,9 @@ public:
         g_Wih->copyToDevice(Wih);
         g_Whh->copyToDevice(Whh);
         g_Bh->copyToDevice(Bh);
-        g_dWih->allocate(hiddenSize, inputSize); g_dWih->zero();
-        g_dWhh->allocate(hiddenSize, hiddenSize); g_dWhh->zero();
-        g_dBh->allocate(hiddenSize); g_dBh->zero();
+        g_dWih->allocate(hiddenSize, inputSize); g_dWih->zero(k_zero_kernel);
+        g_dWhh->allocate(hiddenSize, hiddenSize); g_dWhh->zero(k_zero_kernel);
+        g_dBh->allocate(hiddenSize); g_dBh->zero(k_zero_kernel);
         g_Sum->allocate(hiddenSize);
         g_H->allocate(hiddenSize);
         g_PreH->allocate(hiddenSize);
@@ -659,15 +653,15 @@ public:
         g_Bc = new CLArray(context, queue);  g_Bc->copyToDevice(Bc);
         g_Bo = new CLArray(context, queue);  g_Bo->copyToDevice(Bo);
 
-        g_dWf = new CLMatrix(context, queue); g_dWf->allocate(hiddenSize, concatSize); g_dWf->zero();
-        g_dWi = new CLMatrix(context, queue); g_dWi->allocate(hiddenSize, concatSize); g_dWi->zero();
-        g_dWc = new CLMatrix(context, queue); g_dWc->allocate(hiddenSize, concatSize); g_dWc->zero();
-        g_dWo = new CLMatrix(context, queue); g_dWo->allocate(hiddenSize, concatSize); g_dWo->zero();
+        g_dWf = new CLMatrix(context, queue); g_dWf->allocate(hiddenSize, concatSize); g_dWf->zero(k_zero_kernel);
+        g_dWi = new CLMatrix(context, queue); g_dWi->allocate(hiddenSize, concatSize); g_dWi->zero(k_zero_kernel);
+        g_dWc = new CLMatrix(context, queue); g_dWc->allocate(hiddenSize, concatSize); g_dWc->zero(k_zero_kernel);
+        g_dWo = new CLMatrix(context, queue); g_dWo->allocate(hiddenSize, concatSize); g_dWo->zero(k_zero_kernel);
 
-        g_dBf = new CLArray(context, queue); g_dBf->allocate(hiddenSize); g_dBf->zero();
-        g_dBi = new CLArray(context, queue); g_dBi->allocate(hiddenSize); g_dBi->zero();
-        g_dBc = new CLArray(context, queue); g_dBc->allocate(hiddenSize); g_dBc->zero();
-        g_dBo = new CLArray(context, queue); g_dBo->allocate(hiddenSize); g_dBo->zero();
+        g_dBf = new CLArray(context, queue); g_dBf->allocate(hiddenSize); g_dBf->zero(k_zero_kernel);
+        g_dBi = new CLArray(context, queue); g_dBi->allocate(hiddenSize); g_dBi->zero(k_zero_kernel);
+        g_dBc = new CLArray(context, queue); g_dBc->allocate(hiddenSize); g_dBc->zero(k_zero_kernel);
+        g_dBo = new CLArray(context, queue); g_dBo->allocate(hiddenSize); g_dBo->zero(k_zero_kernel);
 
         g_SumF = new CLArray(context, queue); g_SumF->allocate(hiddenSize);
         g_SumI = new CLArray(context, queue); g_SumI->allocate(hiddenSize);
@@ -857,13 +851,13 @@ public:
         g_Br = new CLArray(context, queue);  g_Br->copyToDevice(Br);
         g_Bh = new CLArray(context, queue);  g_Bh->copyToDevice(Bh);
 
-        g_dWz = new CLMatrix(context, queue); g_dWz->allocate(hiddenSize, concatSize); g_dWz->zero();
-        g_dWr = new CLMatrix(context, queue); g_dWr->allocate(hiddenSize, concatSize); g_dWr->zero();
-        g_dWh = new CLMatrix(context, queue); g_dWh->allocate(hiddenSize, concatSize); g_dWh->zero();
+g_dWz = new CLMatrix(context, queue); g_dWz->allocate(hiddenSize, concatSize); g_dWz->zero(k_zero_kernel);
+g_dWr = new CLMatrix(context, queue); g_dWr->allocate(hiddenSize, concatSize); g_dWr->zero(k_zero_kernel);
+g_dWh = new CLMatrix(context, queue); g_dWh->allocate(hiddenSize, concatSize); g_dWh->zero(k_zero_kernel);
 
-        g_dBz = new CLArray(context, queue); g_dBz->allocate(hiddenSize); g_dBz->zero();
-        g_dBr = new CLArray(context, queue); g_dBr->allocate(hiddenSize); g_dBr->zero();
-        g_dBh = new CLArray(context, queue); g_dBh->allocate(hiddenSize); g_dBh->zero();
+        g_dBz = new CLArray(context, queue); g_dBz->allocate(hiddenSize); g_dBz->zero(k_zero_kernel);
+        g_dBr = new CLArray(context, queue); g_dBr->allocate(hiddenSize); g_dBr->zero(k_zero_kernel);
+        g_dBh = new CLArray(context, queue); g_dBh->allocate(hiddenSize); g_dBh->zero(k_zero_kernel);
 
         g_SumZ = new CLArray(context, queue); g_SumZ->allocate(hiddenSize);
         g_SumR = new CLArray(context, queue); g_SumR->allocate(hiddenSize);
@@ -1038,8 +1032,8 @@ public:
 
         g_W = new CLMatrix(context, queue); g_W->copyToDevice(W);
         g_B = new CLArray(context, queue);  g_B->copyToDevice(B);
-        g_dW = new CLMatrix(context, queue); g_dW->allocate(outputSize, inputSize); g_dW->zero();
-        g_dB = new CLArray(context, queue); g_dB->allocate(outputSize); g_dB->zero();
+        g_dW = new CLMatrix(context, queue); g_dW->allocate(outputSize, inputSize); g_dW->zero(k_zero_kernel);
+        g_dB = new CLArray(context, queue); g_dB->allocate(outputSize); g_dB->zero(k_zero_kernel);
         g_Pre = new CLArray(context, queue); g_Pre->allocate(outputSize);
         g_Out = new CLArray(context, queue); g_Out->allocate(outputSize);
     }
