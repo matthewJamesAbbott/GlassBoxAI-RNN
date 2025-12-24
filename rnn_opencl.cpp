@@ -1326,7 +1326,7 @@ int main(int argc, char** argv) {
         if (inputSize <= 0 || hiddenSize <= 0 || outputSize <= 0 || saveFile.empty()) {
             std::cout << "Error: need --input, --hidden, --output, --save\n"; return 1;
         }
-        RNNModel model(inputSize, hiddenSize, outputSize, hiddenAct, outputAct, lossType, cellType, lr, clipVal, bpttSteps, context, queue, clCreateKernel(program, "zero_array", &err)); CL_CHECK(err);
+        RNNModel model(inputSize, hiddenSize, outputSize, hiddenAct, outputAct, lossType, cellType, lr, clipVal, bpttSteps, context, queue, clCreateKernel(program, "k_zero", &err)); CL_CHECK(err);
         model.Save(saveFile.c_str());
         std::cout << "Model created and saved to: " << saveFile << "\n";
     }
