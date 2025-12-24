@@ -271,21 +271,15 @@ public:
                 dst[i][j] = flat[i * cols + j];
         }
     }
-
-    void zero() {
+    void zero(cl_kernel k_zero_kernel) {
         if (d_ptr && rows * cols > 0) {
             int n = rows * cols;
             size_t globalSize = ((n + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            cl_kernel k_zero_kernel;
-            cl_int err;
-            k_zero_kernel = clCreateKernel(
-                clCreateProgramWithSource(context, 1, &kernelSource, NULL, &err), "k_zero", &err);
-            CL_CHECK(err);
             clSetKernelArg(k_zero_kernel, 0, sizeof(cl_mem), &d_ptr);
             clSetKernelArg(k_zero_kernel, 1, sizeof(int), &n);
-            err = clEnqueueNDRangeKernel(queue, k_zero_kernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+            cl_int err = clEnqueueNDRangeKernel(queue, k_zero_kernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
             CL_CHECK(err);
-            clReleaseKernel(k_zero_kernel);
+            clFinish(queue);
         }
     }
 
@@ -477,7 +471,7 @@ public:
     cl_command_queue queue;
 
     SimpleRNNCell(int inputSize_, int hiddenSize_, TActivationType activation_,
-                  cl_context ctx, cl_command_queue q) :
+                  cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel) :
         inputSize(inputSize_), hiddenSize(hiddenSize_), activation(activation_),
         context(ctx), queue(q)
     {
@@ -619,7 +613,7 @@ public:
     CLArray *g_H, *g_C, *g_Fg, *g_Ig, *g_CTilde, *g_Og, *g_TanhC;
     CLArray *g_Concat, *g_PrevH, *g_PrevC;
 
-    LSTMCell(int inputSize_, int hiddenSize_, TActivationType activation_, cl_context ctx, cl_command_queue q)
+    LSTMCell(int inputSize_, int hiddenSize_, TActivationType activation_, cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel)
         : inputSize(inputSize_), hiddenSize(hiddenSize_), activation(activation_), context(ctx), queue(q)
     {
         int concatSize = inputSize + hiddenSize;
@@ -824,7 +818,7 @@ public:
     CLArray *g_H, *g_Z, *g_R, *g_HTilde;
     CLArray *g_Concat, *g_ConcatR, *g_PrevH;
 
-    GRUCell(int inputSize_, int hiddenSize_, TActivationType activation_, cl_context ctx, cl_command_queue q)
+    GRUCell(int inputSize_, int hiddenSize_, TActivationType activation_, cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel)
         : inputSize(inputSize_), hiddenSize(hiddenSize_), activation(activation_), context(ctx), queue(q)
     {
         int concatSize = inputSize + hiddenSize;
@@ -1021,7 +1015,7 @@ public:
     CLArray* g_Pre;
     CLArray* g_Out;
 
-    OutputLayer(int inputSize_, int outputSize_, TActivationType activation_, cl_context ctx, cl_command_queue q)
+    OutputLayer(int inputSize_, int outputSize_, TActivationType activation_, cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel)
         : inputSize(inputSize_), outputSize(outputSize_), activation(activation_), context(ctx), queue(q)
     {
         float scale = sqrtf(2.0f / inputSize);
@@ -1117,7 +1111,7 @@ public:
     RNNModel(int inputSize_, int hiddenSize_, int outputSize_,
              TActivationType hiddenAct_, TActivationType outputAct_,
              TLossType lossType_, TCellType cellType_, float lr, float clipVal,
-             int bpttSteps_, cl_context ctx, cl_command_queue q)
+             int bpttSteps_, cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel)
         : inputSize(inputSize_), hiddenSize(hiddenSize_), outputSize(outputSize_),
           hiddenActivation(hiddenAct_), outputActivation(outputAct_),
           lossType(lossType_), cellType(cellType_), learningRate(lr), gradClipValue(clipVal),
@@ -1125,13 +1119,13 @@ public:
           simpleCell(nullptr), lstmCell(nullptr), gruCell(nullptr), outputLayer(nullptr)
     {
         if (cellType == ctSimpleRNN) {
-            simpleCell = new SimpleRNNCell(inputSize, hiddenSize, hiddenActivation, context, queue);
+            simpleCell = new SimpleRNNCell(inputSize, hiddenSize, hiddenActivation, context, queue, k_zero_kernel);
         } else if (cellType == ctLSTM) {
-            lstmCell = new LSTMCell(inputSize, hiddenSize, hiddenActivation, context, queue);
+            lstmCell = new LSTMCell(inputSize, hiddenSize, hiddenActivation, context, queue, k_zero_kernel);
         } else if (cellType == ctGRU) {
-            gruCell = new GRUCell(inputSize, hiddenSize, hiddenActivation, context, queue);
+            gruCell = new GRUCell(inputSize, hiddenSize, hiddenActivation, context, queue, k_zero_kernel);
         }
-        outputLayer = new OutputLayer(hiddenSize, outputSize, outputActivation, context, queue);
+        outputLayer = new OutputLayer(hiddenSize, outputSize, outputActivation, context, queue, k_zero_kernel);
     }
 
     ~RNNModel() {
@@ -1332,7 +1326,7 @@ int main(int argc, char** argv) {
         if (inputSize <= 0 || hiddenSize <= 0 || outputSize <= 0 || saveFile.empty()) {
             std::cout << "Error: need --input, --hidden, --output, --save\n"; return 1;
         }
-        RNNModel model(inputSize, hiddenSize, outputSize, hiddenAct, outputAct, lossType, cellType, lr, clipVal, bpttSteps, context, queue);
+        RNNModel model(inputSize, hiddenSize, outputSize, hiddenAct, outputAct, lossType, cellType, lr, clipVal, bpttSteps, context, queue, clCreateKernel(program, "zero_array", &err)); CL_CHECK(err);
         model.Save(saveFile.c_str());
         std::cout << "Model created and saved to: " << saveFile << "\n";
     }
