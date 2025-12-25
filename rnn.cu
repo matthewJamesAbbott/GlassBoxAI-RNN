@@ -18,21 +18,6 @@
 
 using namespace std;
 
-// --- Helper: comma-joined vector formatting ---
-inline void WriteDArray(std::ostream& out, const std::vector<double>& arr) {
-    for (size_t j = 0; j < arr.size(); ++j) {
-        out << std::setprecision(12) << arr[j];
-        if (j + 1 < arr.size()) out << ",";
-    }
-    out << "\n";
-}
-
-inline void Write2DArray(std::ostream& out, const std::vector<std::vector<double>>& mtx) {
-    for (const auto& row : mtx)
-        WriteDArray(out, row);
-}
-
-
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -489,73 +474,6 @@ public:
         g_Concat.allocate(InputSize + HiddenSize);
     }
 
-void Save(const std::string& filename) {
-    std::ofstream out(filename);
-    if (!out.is_open()) {
-        std::cerr << "Failed to open file for saving: " << filename << std::endl;
-        return;
-    }
-    // Save Wih
-    out << "#Wih\n";
-    for (const auto& row : Wih) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Whh
-    out << "#Whh\n";
-    for (const auto& row : Whh) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Bh
-    out << "#Bh\n";
-    for (size_t j = 0; j < Bh.size(); ++j) {
-        out << Bh[j];
-        if (j + 1 < Bh.size()) out << ",";
-    }
-    out << "\n";
-    out.close();
-}
-
-void Load(const std::string& filename) {
-    std::ifstream in(filename);
-    if (!in.is_open()) {
-        std::cerr << "Failed to open file for loading: " << filename << std::endl;
-        return;
-    }
-    std::string line;
-    enum Section { NONE, Wih, Whh, Bh } section = NONE;
-    int rowCount = 0;
-    while (std::getline(in, line)) {
-        if (line == "#Wih")           { section = Wih; rowCount = 0; continue; }
-        else if (line == "#Whh")      { section = Whh; rowCount = 0; continue; }
-        else if (line == "#Bh")       { section = Bh; rowCount = 0; continue; }
-        if (line.empty() || line[0] == '#') continue;
-        std::stringstream ss(line); std::string cell; std::vector<double> vals;
-        while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
-        if (section == Wih && rowCount < Wih.size())   Wih[rowCount++] = vals;
-        else if (section == Whh && rowCount < Whh.size()) Whh[rowCount++] = vals;
-        else if (section == Bh && !vals.empty())       Bh = vals;
-    }
-    in.close();
-    // After loading, upload to device:
-    g_Wih.copyToDevice(Wih); g_Whh.copyToDevice(Whh); g_Bh.copyToDevice(Bh);
-}
-
-void SaveToStream(std::ostream& out) const {
-    out << "#Wih\n";
-    Write2DArray(out, Wih);
-    out << "#Whh\n";
-    Write2DArray(out, Whh);
-    out << "#Bh\n";
-    WriteDArray(out, Bh);
-}
     void Forward(const DArray& Input, const DArray& PrevH, DArray& H, DArray& PreH) {
         // CPU fallback for simplicity - can be GPU accelerated
         H.resize(FHiddenSize);
@@ -700,129 +618,6 @@ public:
         g_PrevH.allocate(HiddenSize); g_PrevC.allocate(HiddenSize);
     }
 
-void Save(const std::string& filename) {
-    std::ofstream out(filename);
-    if (!out.is_open()) {
-        std::cerr << "Failed to open file for saving: " << filename << std::endl;
-        return;
-    }
-    // Save Wf
-    out << "#Wf\n";
-    for (const auto& row : Wf) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Wi
-    out << "#Wi\n";
-    for (const auto& row : Wi) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Wc
-    out << "#Wc\n";
-    for (const auto& row : Wc) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Wo
-    out << "#Wo\n";
-    for (const auto& row : Wo) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Biases
-    out << "#Bf\n";
-    for (size_t j = 0; j < Bf.size(); ++j) {
-        out << Bf[j];
-        if (j + 1 < Bf.size()) out << ",";
-    }
-    out << "\n#Bi\n";
-    for (size_t j = 0; j < Bi.size(); ++j) {
-        out << Bi[j];
-        if (j + 1 < Bi.size()) out << ",";
-    }
-    out << "\n#Bc\n";
-    for (size_t j = 0; j < Bc.size(); ++j) {
-        out << Bc[j];
-        if (j + 1 < Bc.size()) out << ",";
-    }
-    out << "\n#Bo\n";
-    for (size_t j = 0; j < Bo.size(); ++j) {
-        out << Bo[j];
-        if (j + 1 < Bo.size()) out << ",";
-    }
-    out << "\n";
-    out.close();
-}
-
-void Load(const std::string& filename) {
-    std::ifstream in(filename);
-    if (!in.is_open()) {
-        std::cerr << "Failed to open file for loading: " << filename << std::endl;
-        return;
-    }
-    std::string line;
-    enum Section { NONE, Wf, Wi, Wc, Wo, Bf, Bi, Bc, Bo } section = NONE;
-    Wf.clear(); Wi.clear(); Wc.clear(); Wo.clear();
-    Bf.clear(); Bi.clear(); Bc.clear(); Bo.clear();
-    while (std::getline(in, line)) {
-        if (line == "#Wf") { section = Wf; continue; }
-        else if (line == "#Wi") { section = Wi; continue; }
-        else if (line == "#Wc") { section = Wc; continue; }
-        else if (line == "#Wo") { section = Wo; continue; }
-        else if (line == "#Bf") { section = Bf; continue; }
-        else if (line == "#Bi") { section = Bi; continue; }
-        else if (line == "#Bc") { section = Bc; continue; }
-        else if (line == "#Bo") { section = Bo; continue; }
-        if (line.empty() || line[0] == '#') continue;
-        std::stringstream ss(line); std::string cell; std::vector<double> vals;
-        while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
-        if (section == Wf) Wf.push_back(vals);
-        else if (section == Wi) Wi.push_back(vals);
-        else if (section == Wc) Wc.push_back(vals);
-        else if (section == Wo) Wo.push_back(vals);
-        else if (section == Bf) Bf = vals;
-        else if (section == Bi) Bi = vals;
-        else if (section == Bc) Bc = vals;
-        else if (section == Bo) Bo = vals;
-    }
-    in.close();
-    g_Wf.copyToDevice(Wf); g_Wi.copyToDevice(Wi);
-    g_Wc.copyToDevice(Wc); g_Wo.copyToDevice(Wo);
-    g_Bf.copyToDevice(Bf); g_Bi.copyToDevice(Bi);
-    g_Bc.copyToDevice(Bc); g_Bo.copyToDevice(Bo);
-}
-
-void SaveToStream(std::ostream& out) const {
-    out << "#Wf\n";
-    Write2DArray(out, Wf);
-    out << "#Wi\n";
-    Write2DArray(out, Wi);
-    out << "#Wc\n";
-    Write2DArray(out, Wc);
-    out << "#Wo\n";
-    Write2DArray(out, Wo);
-    out << "#Bf\n";
-    WriteDArray(out, Bf);
-    out << "#Bi\n";
-    WriteDArray(out, Bi);
-    out << "#Bc\n";
-    WriteDArray(out, Bc);
-    out << "#Bo\n";
-    WriteDArray(out, Bo);
-}
     void Forward(const DArray& Input, const DArray& PrevH, const DArray& PrevC,
                  DArray& H, DArray& C, DArray& Fg, DArray& Ig, DArray& CTilde,
                  DArray& Og, DArray& TanhC) {
@@ -995,103 +790,6 @@ public:
         g_PrevH.allocate(HiddenSize);
     }
 
-void Save(const std::string& filename) {
-    std::ofstream out(filename);
-    if (!out.is_open()) {
-        std::cerr << "Failed to open file for saving: " << filename << std::endl;
-        return;
-    }
-    // Save Wz
-    out << "#Wz\n";
-    for (const auto& row : Wz) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Wr
-    out << "#Wr\n";
-    for (const auto& row : Wr) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Wh
-    out << "#Wh\n";
-    for (const auto& row : Wh) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save Bz
-    out << "#Bz\n";
-    for (size_t j = 0; j < Bz.size(); ++j) {
-        out << Bz[j];
-        if (j + 1 < Bz.size()) out << ",";
-    }
-    out << "\n#Br\n";
-    for (size_t j = 0; j < Br.size(); ++j) {
-        out << Br[j];
-        if (j + 1 < Br.size()) out << ",";
-    }
-    out << "\n#Bh\n";
-    for (size_t j = 0; j < Bh.size(); ++j) {
-        out << Bh[j];
-        if (j + 1 < Bh.size()) out << ",";
-    }
-    out << "\n";
-    out.close();
-}
-
-void Load(const std::string& filename) {
-    std::ifstream in(filename);
-    if (!in.is_open()) {
-        std::cerr << "Failed to open file for loading: " << filename << std::endl;
-        return;
-    }
-    std::string line;
-    enum Section { NONE, Wz, Wr, Wh, Bz, Br, Bh } section = NONE;
-    int rowCount = 0;
-    while (std::getline(in, line)) {
-        if (line == "#Wz")        { section = Wz; rowCount = 0; continue; }
-        else if (line == "#Wr")   { section = Wr; rowCount = 0; continue; }
-        else if (line == "#Wh")   { section = Wh; rowCount = 0; continue; }
-        else if (line == "#Bz")   { section = Bz; continue; }
-        else if (line == "#Br")   { section = Br; continue; }
-        else if (line == "#Bh")   { section = Bh; continue; }
-        if (line.empty() || line[0] == '#') continue;
-        std::stringstream ss(line); std::string cell; std::vector<double> vals;
-        while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
-        if (section == Wz)       { if (rowCount==0) Wz.clear(); Wz.push_back(vals); ++rowCount; }
-        else if (section == Wr)  { if (rowCount==0) Wr.clear(); Wr.push_back(vals); ++rowCount; }
-        else if (section == Wh)  { if (rowCount==0) Wh.clear(); Wh.push_back(vals); ++rowCount; }
-        else if (section == Bz)  { Bz = vals; }
-        else if (section == Br)  { Br = vals; }
-        else if (section == Bh)  { Bh = vals; }
-    }
-    in.close();
-}
-
-void SaveToStream(std::ostream& out) const {
-    out << "#Wz\n";
-    Write2DArray(out, Wz);
-    out << "#Wr\n";
-    Write2DArray(out, Wr);
-    out << "#Wh\n";
-    Write2DArray(out, Wh);
-    out << "#Bz\n";
-    WriteDArray(out, Bz);
-    out << "#Br\n";
-    WriteDArray(out, Br);
-    out << "#Bh\n";
-    WriteDArray(out, Bh);
-}
-
     void Forward(const DArray& Input, const DArray& PrevH,
                  DArray& H, DArray& Z, DArray& R, DArray& HTilde) {
         int ConcatSize = FInputSize + FHiddenSize;
@@ -1253,56 +951,6 @@ public:
         g_Out.allocate(OutputSize);
     }
 
-void Save(const std::string& filename) {
-    std::ofstream out(filename);
-    if (!out.is_open()) {
-        std::cerr << "Failed to open file for saving: " << filename << std::endl;
-        return;
-    }
-    // Save W
-    out << "#W\n";
-    for (const auto& row : W) {
-        for (size_t j = 0; j < row.size(); ++j) {
-            out << row[j];
-            if (j + 1 < row.size()) out << ",";
-        }
-        out << "\n";
-    }
-    // Save B
-    out << "#B\n";
-    for (size_t j = 0; j < B.size(); ++j) {
-        out << B[j];
-        if (j + 1 < B.size()) out << ",";
-    }
-    out << "\n";
-    out.close();
-}
-
-void Load(const std::string& filename) {
-    std::ifstream in(filename);
-    if (!in.is_open()) {
-        std::cerr << "Failed to open file for loading: " << filename << std::endl;
-        return;
-    }
-    std::string line;
-    enum Section { NONE, W, B } section = NONE;
-    W.clear();
-    B.clear();
-    while (std::getline(in, line)) {
-        if (line == "#W") { section = W; continue; }
-        else if (line == "#B") { section = B; continue; }
-        if (line.empty() || line[0] == '#') continue;
-        std::stringstream ss(line); std::string cell; std::vector<double> vals;
-        while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
-        if (section == W) W.push_back(vals);
-        else if (section == B) B = vals;
-    }
-    in.close();
-    // If running on device, copy to device buffers here if needed:
-    g_W.copyToDevice(W);
-    g_B.copyToDevice(B);
-}
-
     void Forward(const DArray& Input, DArray& Output, DArray& Pre) {
         Pre.resize(FOutputSize);
         Output.resize(FOutputSize);
@@ -1322,12 +970,6 @@ void Load(const std::string& filename) {
         }
     }
 
-SaveToStream(std::ostream& out) const {
-    out << "#W\n";
-    Write2DArray(out, W);
-    out << "#B\n";
-    WriteDArray(out, B);
-}
     void Backward(const DArray& dOut, const DArray& Output, const DArray& Pre,
                   const DArray& Input, double ClipVal, DArray& dInput) {
         DArray dPre(FOutputSize);
@@ -1667,43 +1309,34 @@ void SplitData(const TDArray2D& Inputs, const TDArray2D& Targets, double ValSpli
 
 // ========== CLI Helpers ==========
 void ShowHelp() {
-    cout << "Usage: rnn_cuda [COMMAND] [OPTIONS]" << endl;
+    cout << "Usage: rnn_cuda [OPTIONS]" << endl;
     cout << endl;
-    cout << "CUDA-accelerated single-layer RNN/LSTM/GRU training and inference, scriptable and CLI-friendly.\n";
+    cout << "Train an RNN on sequence data from CSV files (CUDA accelerated)." << endl;
     cout << endl;
-    cout << "Commands:" << endl;
-    cout << "  train         Train a network from CSV input(s), then save model weights" << endl;
-    cout << "  predict       Load model(s) and make predictions on input CSV" << endl;
-    cout << "  save          Save one model cell or output layer to file" << endl;
-    cout << "  load          Load one model cell or output layer from file" << endl;
-    cout << "  help          Show this help message and exit" << endl;
-    cout << endl;
-    cout << "General Options:" << endl;
-    cout << "  -h, --help              Show this help message" << endl;
-    cout << "  --cell TYPE             Cell type: rnn, lstm, gru, output (required for save/load)" << endl;
-    cout << "  --file FILE             File to save to or load from (required for save/load)" << endl;
-    cout << endl;
-    cout << "Train/Prediction Options:" << endl;
+    cout << "Options:" << endl;
+    cout << "  -h, --help              Show this help message and exit" << endl;
     cout << "  -i, --input FILE        Input CSV file (required for train/predict)" << endl;
     cout << "  -t, --target FILE       Target CSV file (required for train)" << endl;
     cout << "  -o, --output FILE       Output predictions to FILE" << endl;
+    cout << "  -m, --model FILE        Model file to save/load" << endl;
+    cout << "  --cell TYPE             Cell type: rnn, lstm, gru (default: lstm)" << endl;
     cout << "  --hidden SIZE           Hidden layer size (default: 32)" << endl;
-    cout << "  --epochs N              Number of epochs (default: 100)" << endl;
+    cout << "  --layers N              Number of hidden layers (default: 1)" << endl;
+    cout << "  --epochs N              Number of training epochs (default: 100)" << endl;
     cout << "  --lr RATE               Learning rate (default: 0.01)" << endl;
+    cout << "  --clip VALUE            Gradient clipping value (default: 5.0)" << endl;
+    cout << "  --val-split RATIO       Validation split ratio (default: 0.2)" << endl;
+    cout << "  --log-interval N        Log every N epochs (default: 10)" << endl;
     cout << "  --activation TYPE       Hidden activation: sigmoid, tanh, relu (default: tanh)" << endl;
     cout << "  --out-activation TYPE   Output activation: sigmoid, tanh, relu, linear (default: linear)" << endl;
-    cout << "  --loss TYPE             Loss: mse, crossentropy (default: mse)" << endl;
+    cout << "  --loss TYPE             Loss function: mse, crossentropy (default: mse)" << endl;
+    cout << "  --seed N                Random seed (default: random)" << endl;
+    cout << "  --predict               Predict mode (requires --input and --model)" << endl;
+    cout << "  --quiet                 Suppress progress output" << endl;
     cout << endl;
     cout << "Examples:" << endl;
-    cout << "  # Train an LSTM and save cell/output weights separately" << endl;
-    cout << "  rnn_cuda train --input train.csv --target t.csv --cell lstm --epochs 100" << endl;
-    cout << "  rnn_cuda save --cell lstm --file mylstm.csv" << endl;
-    cout << "  rnn_cuda save --cell output --file myoutput.csv" << endl;
-    cout << endl;
-    cout << "  # Load previously saved LSTM and output, then predict" << endl;
-    cout << "  rnn_cuda load --cell lstm --file mylstm.csv" << endl;
-    cout << "  rnn_cuda load --cell output --file myoutput.csv" << endl;
-    cout << "  rnn_cuda predict --input test.csv --output preds.csv" << endl;
+    cout << "  rnn_cuda --input data.csv --target labels.csv --epochs 200" << endl;
+    cout << "  rnn_cuda --predict --input test.csv --model model.bin --output predictions.csv" << endl;
     cout << endl;
 }
 
@@ -1802,12 +1435,12 @@ void SaveCSV(const string& FileName, const TDArray2D& Data) {
 
 // ========== Main ==========
 int main(int argc, char* argv[]) {
-    if (argc == 1 || HasArg(argc, argv, "-h") || HasArg(argc, argv, "--help") || HasArg(argc, argv, "help")) {
+    if (argc == 1 || HasArg(argc, argv, "-h") || HasArg(argc, argv, "--help")) {
         ShowHelp();
         return 0;
     }
 
-    // CUDA device check
+    // Check CUDA device
     int deviceCount = 0;
     cudaGetDeviceCount(&deviceCount);
     if (deviceCount == 0) {
@@ -1817,20 +1450,18 @@ int main(int argc, char* argv[]) {
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    if (!HasArg(argc, argv, "--quiet"))
-        cout << "Using CUDA device: " << prop.name << endl;
+    cout << "Using CUDA device: " << prop.name << endl;
 
-    // Basic CLI parsing helpers
     string InputFile = GetArg(argc, argv, "-i");
     if (InputFile.empty()) InputFile = GetArg(argc, argv, "--input");
     string TargetFile = GetArg(argc, argv, "-t");
     if (TargetFile.empty()) TargetFile = GetArg(argc, argv, "--target");
+    string ModelFile = GetArg(argc, argv, "-m");
+    if (ModelFile.empty()) ModelFile = GetArg(argc, argv, "--model");
+    string OutputFile = GetArg(argc, argv, "-o");
+    if (OutputFile.empty()) OutputFile = GetArg(argc, argv, "--output");
 
-    // New CLI args for save/load
-    string SaveFile = GetArg(argc, argv, "--save");
-    string LoadFile = GetArg(argc, argv, "--load");
-    string CellTypeStr = GetArg(argc, argv, "--cell");
-    TCellType CellType = ParseCellType(CellTypeStr);
+    TCellType CellType = ParseCellType(GetArg(argc, argv, "--cell"));
     int HiddenSize = GetArgInt(argc, argv, "--hidden", 32);
     int NumLayers = GetArgInt(argc, argv, "--layers", 1);
     int Epochs = GetArgInt(argc, argv, "--epochs", 100);
@@ -1846,63 +1477,15 @@ int main(int argc, char* argv[]) {
     bool Quiet = HasArg(argc, argv, "--quiet");
     int Seed = GetArgInt(argc, argv, "--seed", -1);
 
-    if (Seed >= 0) srand(Seed);
-    else srand(time(NULL));
+    if (Seed >= 0)
+        srand(Seed);
+    else
+        srand(time(NULL));
 
     vector<int> HiddenSizes(NumLayers, HiddenSize);
 
-    // ---- LOAD FUNCTIONALITY ----
-    if (!LoadFile.empty()) {
-        if (CellTypeStr.empty()) {
-            cerr << "Error: --cell TYPE required when using --load" << endl;
-            return 1;
-        }
-        if (CellType == ctSimpleRNN) {
-            TSimpleRNNCell cell(HiddenSize, HiddenSize, Activation);
-            cell.Load(LoadFile);
-            if (!Quiet) cout << "Loaded SimpleRNN weights from: " << LoadFile << endl;
-        } else if (CellType == ctLSTM) {
-            TLSTMCell cell(HiddenSize, HiddenSize, Activation);
-            cell.Load(LoadFile);
-            if (!Quiet) cout << "Loaded LSTM weights from: " << LoadFile << endl;
-        } else if (CellType == ctGRU) {
-            TGRUCell cell(HiddenSize, HiddenSize, Activation);
-            cell.Load(LoadFile);
-            if (!Quiet) cout << "Loaded GRU weights from: " << LoadFile << endl;
-        } else {
-            cerr << "Unknown cell type for load.\n";
-            return 1;
-        }
-        return 0;
-    }
-    // ---- SAVE FUNCTIONALITY ----
-    if (!SaveFile.empty()) {
-        if (CellTypeStr.empty()) {
-            cerr << "Error: --cell TYPE required when using --save" << endl;
-            return 1;
-        }
-        if (CellType == ctSimpleRNN) {
-            TSimpleRNNCell cell(HiddenSize, HiddenSize, Activation);
-            cell.Save(SaveFile);
-            if (!Quiet) cout << "Saved SimpleRNN weights to: " << SaveFile << endl;
-        } else if (CellType == ctLSTM) {
-            TLSTMCell cell(HiddenSize, HiddenSize, Activation);
-            cell.Save(SaveFile);
-            if (!Quiet) cout << "Saved LSTM weights to: " << SaveFile << endl;
-        } else if (CellType == ctGRU) {
-            TGRUCell cell(HiddenSize, HiddenSize, Activation);
-            cell.Save(SaveFile);
-            if (!Quiet) cout << "Saved GRU weights to: " << SaveFile << endl;
-        } else {
-            cerr << "Unknown cell type for save.\n";
-            return 1;
-        }
-        return 0;
-    }
-
-    // ---- TRAINING AND PREDICT FUNCTIONALITY ----
     if (InputFile.empty()) {
-        cerr << "Error: --input is required for train/predict" << endl;
+        cerr << "Error: --input is required" << endl;
         return 1;
     }
 
@@ -1910,6 +1493,10 @@ int main(int argc, char* argv[]) {
     int InputSize = Inputs[0].size();
 
     if (PredictMode) {
+        if (ModelFile.empty()) {
+            cerr << "Error: --model is required for prediction" << endl;
+            return 1;
+        }
         cerr << "Predict mode not yet implemented (model loading required)" << endl;
         return 1;
     } else {
@@ -1988,9 +1575,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        string OutputFile = GetArg(argc, argv, "-o");
-        if (OutputFile.empty()) OutputFile = GetArg(argc, argv, "--output");
-
         if (!OutputFile.empty()) {
             TDArray2D Predictions = RNN->Predict(Inputs);
             SaveCSV(OutputFile, Predictions);
@@ -2001,18 +1585,7 @@ int main(int argc, char* argv[]) {
         if (!Quiet)
             cout << "Training complete." << endl;
 
-        // Optionally, save model weights after training (example: --save option)
-        if (!SaveFile.empty()) {
-            if (CellType == ctSimpleRNN)
-                RNN->GetCell()->Save(SaveFile);
-            else if (CellType == ctLSTM)
-                RNN->GetCell()->Save(SaveFile);
-            else if (CellType == ctGRU)
-                RNN->GetCell()->Save(SaveFile);
-            if (!Quiet)
-                cout << "Model cell weights saved to: " << SaveFile << endl;
-        }
-        // TODO: Save output layer weights if needed
+        delete RNN;
     }
 
     return 0;
