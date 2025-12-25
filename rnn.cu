@@ -1158,6 +1158,30 @@ public:
         g_Out.allocate(OutputSize);
     }
 
+void Save(const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out.is_open()) {
+        std::cerr << "Failed to open file for saving: " << filename << std::endl;
+        return;
+    }
+    // Save W
+    out << "#W\n";
+    for (const auto& row : W) {
+        for (size_t j = 0; j < row.size(); ++j) {
+            out << row[j];
+            if (j + 1 < row.size()) out << ",";
+        }
+        out << "\n";
+    }
+    // Save B
+    out << "#B\n";
+    for (size_t j = 0; j < B.size(); ++j) {
+        out << B[j];
+        if (j + 1 < B.size()) out << ",";
+    }
+    out << "\n";
+    out.close();
+}
     void Forward(const DArray& Input, DArray& Output, DArray& Pre) {
         Pre.resize(FOutputSize);
         Output.resize(FOutputSize);
