@@ -743,6 +743,45 @@ void Save(const std::string& filename) {
     out.close();
 }
 
+void Load(const std::string& filename) {
+    std::ifstream in(filename);
+    if (!in.is_open()) {
+        std::cerr << "Failed to open file for loading: " << filename << std::endl;
+        return;
+    }
+    std::string line;
+    enum Section { NONE, Wf, Wi, Wc, Wo, Bf, Bi, Bc, Bo } section = NONE;
+    Wf.clear(); Wi.clear(); Wc.clear(); Wo.clear();
+    Bf.clear(); Bi.clear(); Bc.clear(); Bo.clear();
+    while (std::getline(in, line)) {
+        if (line == "#Wf") { section = Wf; continue; }
+        else if (line == "#Wi") { section = Wi; continue; }
+        else if (line == "#Wc") { section = Wc; continue; }
+        else if (line == "#Wo") { section = Wo; continue; }
+        else if (line == "#Bf") { section = Bf; continue; }
+        else if (line == "#Bi") { section = Bi; continue; }
+        else if (line == "#Bc") { section = Bc; continue; }
+        else if (line == "#Bo") { section = Bo; continue; }
+        if (line.empty() || line[0] == '#') continue;
+        std::stringstream ss(line); std::string cell; std::vector<double> vals;
+        while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
+        if (section == Wf) Wf.push_back(vals);
+        else if (section == Wi) Wi.push_back(vals);
+        else if (section == Wc) Wc.push_back(vals);
+        else if (section == Wo) Wo.push_back(vals);
+        else if (section == Bf) Bf = vals;
+        else if (section == Bi) Bi = vals;
+        else if (section == Bc) Bc = vals;
+        else if (section == Bo) Bo = vals;
+    }
+    in.close();
+    g_Wf.copyToDevice(Wf); g_Wi.copyToDevice(Wi);
+    g_Wc.copyToDevice(Wc); g_Wo.copyToDevice(Wo);
+    g_Bf.copyToDevice(Bf); g_Bi.copyToDevice(Bi);
+    g_Bc.copyToDevice(Bc); g_Bo.copyToDevice(Bo);
+}
+
+
     void Forward(const DArray& Input, const DArray& PrevH, const DArray& PrevC,
                  DArray& H, DArray& C, DArray& Fg, DArray& Ig, DArray& CTilde,
                  DArray& Og, DArray& TanhC) {
@@ -1182,6 +1221,32 @@ void Save(const std::string& filename) {
     out << "\n";
     out.close();
 }
+
+void Load(const std::string& filename) {
+    std::ifstream in(filename);
+    if (!in.is_open()) {
+        std::cerr << "Failed to open file for loading: " << filename << std::endl;
+        return;
+    }
+    std::string line;
+    enum Section { NONE, W, B } section = NONE;
+    W.clear();
+    B.clear();
+    while (std::getline(in, line)) {
+        if (line == "#W") { section = W; continue; }
+        else if (line == "#B") { section = B; continue; }
+        if (line.empty() || line[0] == '#') continue;
+        std::stringstream ss(line); std::string cell; std::vector<double> vals;
+        while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
+        if (section == W) W.push_back(vals);
+        else if (section == B) B = vals;
+    }
+    in.close();
+    // If running on device, copy to device buffers here if needed:
+    g_W.copyToDevice(W);
+    g_B.copyToDevice(B);
+}
+
     void Forward(const DArray& Input, DArray& Output, DArray& Pre) {
         Pre.resize(FOutputSize);
         Output.resize(FOutputSize);
