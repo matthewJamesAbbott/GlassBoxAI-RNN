@@ -1540,34 +1540,43 @@ void SplitData(const TDArray2D& Inputs, const TDArray2D& Targets, double ValSpli
 
 // ========== CLI Helpers ==========
 void ShowHelp() {
-    cout << "Usage: rnn_cuda [OPTIONS]" << endl;
+    cout << "Usage: rnn_cuda [COMMAND] [OPTIONS]" << endl;
     cout << endl;
-    cout << "Train an RNN on sequence data from CSV files (CUDA accelerated)." << endl;
+    cout << "CUDA-accelerated single-layer RNN/LSTM/GRU training and inference, scriptable and CLI-friendly.\n";
     cout << endl;
-    cout << "Options:" << endl;
-    cout << "  -h, --help              Show this help message and exit" << endl;
+    cout << "Commands:" << endl;
+    cout << "  train         Train a network from CSV input(s), then save model weights" << endl;
+    cout << "  predict       Load model(s) and make predictions on input CSV" << endl;
+    cout << "  save          Save one model cell or output layer to file" << endl;
+    cout << "  load          Load one model cell or output layer from file" << endl;
+    cout << "  help          Show this help message and exit" << endl;
+    cout << endl;
+    cout << "General Options:" << endl;
+    cout << "  -h, --help              Show this help message" << endl;
+    cout << "  --cell TYPE             Cell type: rnn, lstm, gru, output (required for save/load)" << endl;
+    cout << "  --file FILE             File to save to or load from (required for save/load)" << endl;
+    cout << endl;
+    cout << "Train/Prediction Options:" << endl;
     cout << "  -i, --input FILE        Input CSV file (required for train/predict)" << endl;
     cout << "  -t, --target FILE       Target CSV file (required for train)" << endl;
     cout << "  -o, --output FILE       Output predictions to FILE" << endl;
-    cout << "  -m, --model FILE        Model file to save/load" << endl;
-    cout << "  --cell TYPE             Cell type: rnn, lstm, gru (default: lstm)" << endl;
     cout << "  --hidden SIZE           Hidden layer size (default: 32)" << endl;
-    cout << "  --layers N              Number of hidden layers (default: 1)" << endl;
-    cout << "  --epochs N              Number of training epochs (default: 100)" << endl;
+    cout << "  --epochs N              Number of epochs (default: 100)" << endl;
     cout << "  --lr RATE               Learning rate (default: 0.01)" << endl;
-    cout << "  --clip VALUE            Gradient clipping value (default: 5.0)" << endl;
-    cout << "  --val-split RATIO       Validation split ratio (default: 0.2)" << endl;
-    cout << "  --log-interval N        Log every N epochs (default: 10)" << endl;
     cout << "  --activation TYPE       Hidden activation: sigmoid, tanh, relu (default: tanh)" << endl;
     cout << "  --out-activation TYPE   Output activation: sigmoid, tanh, relu, linear (default: linear)" << endl;
-    cout << "  --loss TYPE             Loss function: mse, crossentropy (default: mse)" << endl;
-    cout << "  --seed N                Random seed (default: random)" << endl;
-    cout << "  --predict               Predict mode (requires --input and --model)" << endl;
-    cout << "  --quiet                 Suppress progress output" << endl;
+    cout << "  --loss TYPE             Loss: mse, crossentropy (default: mse)" << endl;
     cout << endl;
     cout << "Examples:" << endl;
-    cout << "  rnn_cuda --input data.csv --target labels.csv --epochs 200" << endl;
-    cout << "  rnn_cuda --predict --input test.csv --model model.bin --output predictions.csv" << endl;
+    cout << "  # Train an LSTM and save cell/output weights separately" << endl;
+    cout << "  rnn_cuda train --input train.csv --target t.csv --cell lstm --epochs 100" << endl;
+    cout << "  rnn_cuda save --cell lstm --file mylstm.csv" << endl;
+    cout << "  rnn_cuda save --cell output --file myoutput.csv" << endl;
+    cout << endl;
+    cout << "  # Load previously saved LSTM and output, then predict" << endl;
+    cout << "  rnn_cuda load --cell lstm --file mylstm.csv" << endl;
+    cout << "  rnn_cuda load --cell output --file myoutput.csv" << endl;
+    cout << "  rnn_cuda predict --input test.csv --output preds.csv" << endl;
     cout << endl;
 }
 
