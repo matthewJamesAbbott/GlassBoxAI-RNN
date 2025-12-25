@@ -921,26 +921,45 @@ void Save(const std::string& filename) {
         std::cerr << "Failed to open file for saving: " << filename << std::endl;
         return;
     }
-    // Save Wih
-    out << "#Wih\n";
-    for (const auto& row : Wih) {
+    // Save Wz
+    out << "#Wz\n";
+    for (const auto& row : Wz) {
         for (size_t j = 0; j < row.size(); ++j) {
             out << row[j];
             if (j + 1 < row.size()) out << ",";
         }
         out << "\n";
     }
-    // Save Whh
-    out << "#Whh\n";
-    for (const auto& row : Whh) {
+    // Save Wr
+    out << "#Wr\n";
+    for (const auto& row : Wr) {
         for (size_t j = 0; j < row.size(); ++j) {
             out << row[j];
             if (j + 1 < row.size()) out << ",";
         }
         out << "\n";
     }
-    // Save Bh
-    out << "#Bh\n";
+    // Save Wh
+    out << "#Wh\n";
+    for (const auto& row : Wh) {
+        for (size_t j = 0; j < row.size(); ++j) {
+            out << row[j];
+            if (j + 1 < row.size()) out << ",";
+        }
+        out << "\n";
+    }
+    // Save Bz
+    out << "#Bz\n";
+    for (size_t j = 0; j < Bz.size(); ++j) {
+        out << Bz[j];
+        if (j + 1 < Bz.size()) out << ",";
+    }
+    out << "\n#Br\n";
+    for (size_t j = 0; j < Br.size(); ++j) {
+        out << Br[j];
+        if (j + 1 < Br.size()) out << ",";
+    }
+    out << "\n#Bh\n";
     for (size_t j = 0; j < Bh.size(); ++j) {
         out << Bh[j];
         if (j + 1 < Bh.size()) out << ",";
@@ -956,22 +975,26 @@ void Load(const std::string& filename) {
         return;
     }
     std::string line;
-    enum Section { NONE, Wih, Whh, Bh } section = NONE;
+    enum Section { NONE, Wz, Wr, Wh, Bz, Br, Bh } section = NONE;
     int rowCount = 0;
     while (std::getline(in, line)) {
-        if (line == "#Wih")           { section = Wih; rowCount = 0; continue; }
-        else if (line == "#Whh")      { section = Whh; rowCount = 0; continue; }
-        else if (line == "#Bh")       { section = Bh; rowCount = 0; continue; }
+        if (line == "#Wz")        { section = Wz; rowCount = 0; continue; }
+        else if (line == "#Wr")   { section = Wr; rowCount = 0; continue; }
+        else if (line == "#Wh")   { section = Wh; rowCount = 0; continue; }
+        else if (line == "#Bz")   { section = Bz; continue; }
+        else if (line == "#Br")   { section = Br; continue; }
+        else if (line == "#Bh")   { section = Bh; continue; }
         if (line.empty() || line[0] == '#') continue;
         std::stringstream ss(line); std::string cell; std::vector<double> vals;
         while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
-        if (section == Wih && rowCount < Wih.size())   Wih[rowCount++] = vals;
-        else if (section == Whh && rowCount < Whh.size()) Whh[rowCount++] = vals;
-        else if (section == Bh && !vals.empty())       Bh = vals;
+        if (section == Wz)       { if (rowCount==0) Wz.clear(); Wz.push_back(vals); ++rowCount; }
+        else if (section == Wr)  { if (rowCount==0) Wr.clear(); Wr.push_back(vals); ++rowCount; }
+        else if (section == Wh)  { if (rowCount==0) Wh.clear(); Wh.push_back(vals); ++rowCount; }
+        else if (section == Bz)  { Bz = vals; }
+        else if (section == Br)  { Br = vals; }
+        else if (section == Bh)  { Bh = vals; }
     }
     in.close();
-    // After loading, upload to device:
-    g_Wih.copyToDevice(Wih); g_Whh.copyToDevice(Whh); g_Bh.copyToDevice(Bh);
 }
 
     void Forward(const DArray& Input, const DArray& PrevH,
