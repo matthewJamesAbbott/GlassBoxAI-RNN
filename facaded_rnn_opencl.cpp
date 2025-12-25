@@ -1,7 +1,6 @@
 //
 // Matthew Abbott 2025
 //
-
 #define CL_TARGET_OPENCL_VERSION 120
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
@@ -1127,11 +1126,58 @@ public:
     // Backward, optimizer step, save/load omitted -- similar to CUDA/OpenCL implementation
 };
 
+void PrintUsage(const char* progname) {
+    cout << "RNN Facade CLI (OpenCL GPU/CPU) - Matthew Abbott 2025\n\n";
+    cout << "Usage: " << progname << " <command> [options]\n\n";
+    cout << "Commands:\n";
+    cout << "  create              Create and initialize an RNN model\n";
+    cout << "  train               Train the model on data\n";
+    cout << "  predict             Run prediction on input data\n";
+    cout << "  info                Display GPU/CPU device information\n";
+    cout << "\nFacade Introspection Commands:\n";
+    cout << "  get-hidden          Get hidden state value\n";
+    cout << "  set-hidden          Set hidden state value\n";
+    cout << "  get-output          Get output value at timestep\n";
+    cout << "  get-cell-state      Get LSTM cell state\n";
+    cout << "  get-gate            Get gate value (LSTM/GRU)\n";
+    cout << "  get-preactivation   Get pre-activation value\n";
+    cout << "  get-input           Get input vector value\n";
+    cout << "  reset-states        Reset all hidden/cell states\n";
+    cout << "  set-dropout         Set dropout rate\n";
+    cout << "  get-dropout         Get current dropout rate\n";
+    cout << "  detect-vanishing    Check for vanishing gradients\n";
+    cout << "  detect-exploding    Check for exploding gradients\n";
+    cout << "  get-seq-outputs     Get all outputs for a sequence\n";
+    cout << "  get-seq-hidden      Get hidden states over sequence\n";
+    cout << "\nCreate/Train/Predict options:\n";
+    cout << "  --input-size <n>       Input dimension (required)\n";
+    cout << "  --hidden-sizes <n,n>   Comma-separated hidden layer sizes (required)\n";
+    cout << "  --output-size <n>      Output dimension (required)\n";
+    cout << "  --cell-type <type>     rnn, lstm, or gru (default: lstm)\n";
+    cout << "  --activation <type>    sigmoid, tanh, relu, linear (default: tanh)\n";
+    cout << "  --output-activation    Output layer activation (default: sigmoid)\n";
+    cout << "  --loss <type>          mse or crossentropy (default: mse)\n";
+    cout << "  --learning-rate <f>    Learning rate (default: 0.01)\n";
+    cout << "  --gradient-clip <f>    Gradient clipping value (default: 5.0)\n";
+    cout << "  --bptt-steps <n>       BPTT truncation steps (default: 0 = full)\n";
+    cout << "  --epochs <n>           Number of training epochs (default: 100)\n";
+    cout << "  --input-file <file>    CSV file with input sequences\n";
+    cout << "  --target-file <file>   CSV file with target sequences\n";
+    cout << "  --output-file <file>   CSV file to write predictions\n";
+    cout << "\nFacade options:\n";
+    cout << "  --layer <n>            Layer index (default: 0)\n";
+    cout << "  --timestep <n>         Timestep index (default: 0)\n";
+    cout << "  --neuron <n>           Neuron index (default: 0)\n";
+    cout << "  --output-idx <n>       Output index (default: 0)\n";
+    cout << "  --value <f>            Value to set\n";
+    cout << "  --gate <type>          Gate type: forget,input,output,cell,update,reset,hidden\n";
+    cout << "  --threshold <f>        Threshold for gradient detection (default: 1e-6)\n";
+}
+
 int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
-    if (argc < 2) {
-        std::cout << "Usage: <command> [options]\n";
-        std::cout << "Commands: create, train, predict, info, help\n";
+    if (argc < 2 || std::string(argv[1]) == "help" || std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
+        PrintUsage(argv[0]);
         return 0;
     }
     // Command parse
