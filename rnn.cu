@@ -474,6 +474,64 @@ public:
         g_Concat.allocate(InputSize + HiddenSize);
     }
 
+void Save(const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out.is_open()) {
+        std::cerr << "Failed to open file for saving: " << filename << std::endl;
+        return;
+    }
+    // Save Wih
+    out << "#Wih\n";
+    for (const auto& row : Wih) {
+        for (size_t j = 0; j < row.size(); ++j) {
+            out << row[j];
+            if (j + 1 < row.size()) out << ",";
+        }
+        out << "\n";
+    }
+    // Save Whh
+    out << "#Whh\n";
+    for (const auto& row : Whh) {
+        for (size_t j = 0; j < row.size(); ++j) {
+            out << row[j];
+            if (j + 1 < row.size()) out << ",";
+        }
+        out << "\n";
+    }
+    // Save Bh
+    out << "#Bh\n";
+    for (size_t j = 0; j < Bh.size(); ++j) {
+        out << Bh[j];
+        if (j + 1 < Bh.size()) out << ",";
+    }
+    out << "\n";
+    out.close();
+}
+
+void Load(const std::string& filename) {
+    std::ifstream in(filename);
+    if (!in.is_open()) {
+        std::cerr << "Failed to open file for loading: " << filename << std::endl;
+        return;
+    }
+    std::string line;
+    enum Section { NONE, Wih, Whh, Bh } section = NONE;
+    int rowCount = 0;
+    while (std::getline(in, line)) {
+        if (line == "#Wih")           { section = Wih; rowCount = 0; continue; }
+        else if (line == "#Whh")      { section = Whh; rowCount = 0; continue; }
+        else if (line == "#Bh")       { section = Bh; rowCount = 0; continue; }
+        if (line.empty() || line[0] == '#') continue;
+        std::stringstream ss(line); std::string cell; std::vector<double> vals;
+        while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
+        if (section == Wih && rowCount < Wih.size())   Wih[rowCount++] = vals;
+        else if (section == Whh && rowCount < Whh.size()) Whh[rowCount++] = vals;
+        else if (section == Bh && !vals.empty())       Bh = vals;
+    }
+    in.close();
+    // After loading, upload to device:
+    g_Wih.copyToDevice(Wih); g_Whh.copyToDevice(Whh); g_Bh.copyToDevice(Bh);
+}
     void Forward(const DArray& Input, const DArray& PrevH, DArray& H, DArray& PreH) {
         // CPU fallback for simplicity - can be GPU accelerated
         H.resize(FHiddenSize);
