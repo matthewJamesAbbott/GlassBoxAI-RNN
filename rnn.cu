@@ -18,6 +18,21 @@
 
 using namespace std;
 
+// --- Helper: comma-joined vector formatting ---
+inline void WriteDArray(std::ostream& out, const std::vector<double>& arr) {
+    for (size_t j = 0; j < arr.size(); ++j) {
+        out << std::setprecision(12) << arr[j];
+        if (j + 1 < arr.size()) out << ",";
+    }
+    out << "\n";
+}
+
+inline void Write2DArray(std::ostream& out, const std::vector<std::vector<double>>& mtx) {
+    for (const auto& row : mtx)
+        WriteDArray(out, row);
+}
+
+
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -532,6 +547,15 @@ void Load(const std::string& filename) {
     // After loading, upload to device:
     g_Wih.copyToDevice(Wih); g_Whh.copyToDevice(Whh); g_Bh.copyToDevice(Bh);
 }
+
+void SaveToStream(std::ostream& out) const {
+    out << "#Wih\n";
+    Write2DArray(out, Wih);
+    out << "#Whh\n";
+    Write2DArray(out, Whh);
+    out << "#Bh\n";
+    WriteDArray(out, Bh);
+}
     void Forward(const DArray& Input, const DArray& PrevH, DArray& H, DArray& PreH) {
         // CPU fallback for simplicity - can be GPU accelerated
         H.resize(FHiddenSize);
@@ -781,7 +805,24 @@ void Load(const std::string& filename) {
     g_Bc.copyToDevice(Bc); g_Bo.copyToDevice(Bo);
 }
 
-
+void SaveToStream(std::ostream& out) const {
+    out << "#Wf\n";
+    Write2DArray(out, Wf);
+    out << "#Wi\n";
+    Write2DArray(out, Wi);
+    out << "#Wc\n";
+    Write2DArray(out, Wc);
+    out << "#Wo\n";
+    Write2DArray(out, Wo);
+    out << "#Bf\n";
+    WriteDArray(out, Bf);
+    out << "#Bi\n";
+    WriteDArray(out, Bi);
+    out << "#Bc\n";
+    WriteDArray(out, Bc);
+    out << "#Bo\n";
+    WriteDArray(out, Bo);
+}
     void Forward(const DArray& Input, const DArray& PrevH, const DArray& PrevC,
                  DArray& H, DArray& C, DArray& Fg, DArray& Ig, DArray& CTilde,
                  DArray& Og, DArray& TanhC) {
@@ -1036,6 +1077,21 @@ void Load(const std::string& filename) {
     in.close();
 }
 
+void SaveToStream(std::ostream& out) const {
+    out << "#Wz\n";
+    Write2DArray(out, Wz);
+    out << "#Wr\n";
+    Write2DArray(out, Wr);
+    out << "#Wh\n";
+    Write2DArray(out, Wh);
+    out << "#Bz\n";
+    WriteDArray(out, Bz);
+    out << "#Br\n";
+    WriteDArray(out, Br);
+    out << "#Bh\n";
+    WriteDArray(out, Bh);
+}
+
     void Forward(const DArray& Input, const DArray& PrevH,
                  DArray& H, DArray& Z, DArray& R, DArray& HTilde) {
         int ConcatSize = FInputSize + FHiddenSize;
@@ -1266,6 +1322,12 @@ void Load(const std::string& filename) {
         }
     }
 
+SaveToStream(std::ostream& out) const {
+    out << "#W\n";
+    Write2DArray(out, W);
+    out << "#B\n";
+    WriteDArray(out, B);
+}
     void Backward(const DArray& dOut, const DArray& Output, const DArray& Pre,
                   const DArray& Input, double ClipVal, DArray& dInput) {
         DArray dPre(FOutputSize);
