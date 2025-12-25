@@ -1675,12 +1675,12 @@ void SaveCSV(const string& FileName, const TDArray2D& Data) {
 
 // ========== Main ==========
 int main(int argc, char* argv[]) {
-    if (argc == 1 || HasArg(argc, argv, "-h") || HasArg(argc, argv, "--help")) {
+    if (argc == 1 || HasArg(argc, argv, "-h") || HasArg(argc, argv, "--help") || HasArg(argc, argv, "help")) {
         ShowHelp();
         return 0;
     }
 
-    // Check CUDA device
+    // CUDA device check
     int deviceCount = 0;
     cudaGetDeviceCount(&deviceCount);
     if (deviceCount == 0) {
@@ -1690,18 +1690,20 @@ int main(int argc, char* argv[]) {
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    cout << "Using CUDA device: " << prop.name << endl;
+    if (!HasArg(argc, argv, "--quiet"))
+        cout << "Using CUDA device: " << prop.name << endl;
 
+    // Basic CLI parsing helpers
     string InputFile = GetArg(argc, argv, "-i");
     if (InputFile.empty()) InputFile = GetArg(argc, argv, "--input");
     string TargetFile = GetArg(argc, argv, "-t");
     if (TargetFile.empty()) TargetFile = GetArg(argc, argv, "--target");
-    string ModelFile = GetArg(argc, argv, "-m");
-    if (ModelFile.empty()) ModelFile = GetArg(argc, argv, "--model");
-    string OutputFile = GetArg(argc, argv, "-o");
-    if (OutputFile.empty()) OutputFile = GetArg(argc, argv, "--output");
 
-    TCellType CellType = ParseCellType(GetArg(argc, argv, "--cell"));
+    // New CLI args for save/load
+    string SaveFile = GetArg(argc, argv, "--save");
+    string LoadFile = GetArg(argc, argv, "--load");
+    string CellTypeStr = GetArg(argc, argv, "--cell");
+    TCellType CellType = ParseCellType(CellTypeStr);
     int HiddenSize = GetArgInt(argc, argv, "--hidden", 32);
     int NumLayers = GetArgInt(argc, argv, "--layers", 1);
     int Epochs = GetArgInt(argc, argv, "--epochs", 100);
@@ -1717,15 +1719,63 @@ int main(int argc, char* argv[]) {
     bool Quiet = HasArg(argc, argv, "--quiet");
     int Seed = GetArgInt(argc, argv, "--seed", -1);
 
-    if (Seed >= 0)
-        srand(Seed);
-    else
-        srand(time(NULL));
+    if (Seed >= 0) srand(Seed);
+    else srand(time(NULL));
 
     vector<int> HiddenSizes(NumLayers, HiddenSize);
 
+    // ---- LOAD FUNCTIONALITY ----
+    if (!LoadFile.empty()) {
+        if (CellTypeStr.empty()) {
+            cerr << "Error: --cell TYPE required when using --load" << endl;
+            return 1;
+        }
+        if (CellType == ctSimpleRNN) {
+            TSimpleRNNCell cell(HiddenSize, HiddenSize, Activation);
+            cell.Load(LoadFile);
+            if (!Quiet) cout << "Loaded SimpleRNN weights from: " << LoadFile << endl;
+        } else if (CellType == ctLSTM) {
+            TLSTMCell cell(HiddenSize, HiddenSize, Activation);
+            cell.Load(LoadFile);
+            if (!Quiet) cout << "Loaded LSTM weights from: " << LoadFile << endl;
+        } else if (CellType == ctGRU) {
+            TGRUCell cell(HiddenSize, HiddenSize, Activation);
+            cell.Load(LoadFile);
+            if (!Quiet) cout << "Loaded GRU weights from: " << LoadFile << endl;
+        } else {
+            cerr << "Unknown cell type for load.\n";
+            return 1;
+        }
+        return 0;
+    }
+    // ---- SAVE FUNCTIONALITY ----
+    if (!SaveFile.empty()) {
+        if (CellTypeStr.empty()) {
+            cerr << "Error: --cell TYPE required when using --save" << endl;
+            return 1;
+        }
+        if (CellType == ctSimpleRNN) {
+            TSimpleRNNCell cell(HiddenSize, HiddenSize, Activation);
+            cell.Save(SaveFile);
+            if (!Quiet) cout << "Saved SimpleRNN weights to: " << SaveFile << endl;
+        } else if (CellType == ctLSTM) {
+            TLSTMCell cell(HiddenSize, HiddenSize, Activation);
+            cell.Save(SaveFile);
+            if (!Quiet) cout << "Saved LSTM weights to: " << SaveFile << endl;
+        } else if (CellType == ctGRU) {
+            TGRUCell cell(HiddenSize, HiddenSize, Activation);
+            cell.Save(SaveFile);
+            if (!Quiet) cout << "Saved GRU weights to: " << SaveFile << endl;
+        } else {
+            cerr << "Unknown cell type for save.\n";
+            return 1;
+        }
+        return 0;
+    }
+
+    // ---- TRAINING AND PREDICT FUNCTIONALITY ----
     if (InputFile.empty()) {
-        cerr << "Error: --input is required" << endl;
+        cerr << "Error: --input is required for train/predict" << endl;
         return 1;
     }
 
@@ -1733,10 +1783,6 @@ int main(int argc, char* argv[]) {
     int InputSize = Inputs[0].size();
 
     if (PredictMode) {
-        if (ModelFile.empty()) {
-            cerr << "Error: --model is required for prediction" << endl;
-            return 1;
-        }
         cerr << "Predict mode not yet implemented (model loading required)" << endl;
         return 1;
     } else {
@@ -1815,6 +1861,9 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        string OutputFile = GetArg(argc, argv, "-o");
+        if (OutputFile.empty()) OutputFile = GetArg(argc, argv, "--output");
+
         if (!OutputFile.empty()) {
             TDArray2D Predictions = RNN->Predict(Inputs);
             SaveCSV(OutputFile, Predictions);
@@ -1825,7 +1874,18 @@ int main(int argc, char* argv[]) {
         if (!Quiet)
             cout << "Training complete." << endl;
 
-        delete RNN;
+        // Optionally, save model weights after training (example: --save option)
+        if (!SaveFile.empty()) {
+            if (CellType == ctSimpleRNN)
+                RNN->GetCell()->Save(SaveFile);
+            else if (CellType == ctLSTM)
+                RNN->GetCell()->Save(SaveFile);
+            else if (CellType == ctGRU)
+                RNN->GetCell()->Save(SaveFile);
+            if (!Quiet)
+                cout << "Model cell weights saved to: " << SaveFile << endl;
+        }
+        // TODO: Save output layer weights if needed
     }
 
     return 0;
