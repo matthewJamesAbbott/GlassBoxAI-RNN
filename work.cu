@@ -649,9 +649,9 @@ void Load(const std::string& filename) {
     enum section { NONE, SecWih, SecWhh, SecBh } section = NONE;
     int rowCount = 0;
     while (std::getline(in, line)) {
-        if (line == "#Wih")           { section = Wih; rowCount = 0; continue; }
-        else if (line == "#Whh")      { section = Whh; rowCount = 0; continue; }
-        else if (line == "#Bh")       { section = Bh; rowCount = 0; continue; }
+        if (line == "#Wih")           { section = SecWih; rowCount = 0; continue; }
+        else if (line == "#Whh")      { section = SecWhh; rowCount = 0; continue; }
+        else if (line == "#Bh")       { section = SecBh; rowCount = 0; continue; }
         if (line.empty() || line[0] == '#') continue;
         std::stringstream ss(line); std::string cell; std::vector<double> vals;
         while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
