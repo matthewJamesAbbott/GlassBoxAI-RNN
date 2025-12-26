@@ -655,9 +655,9 @@ void Load(const std::string& filename) {
         if (line.empty() || line[0] == '#') continue;
         std::stringstream ss(line); std::string cell; std::vector<double> vals;
         while (std::getline(ss, cell, ',')) vals.push_back(std::stod(cell));
-        if (section == Wih && rowCount < Wih.size())   Wih[rowCount++] = vals;
-        else if (section == Whh && rowCount < Whh.size()) Whh[rowCount++] = vals;
-        else if (section == Bh && !vals.empty())       Bh = vals;
+        if (section == SecWih && rowCount < SecWih.size())   SecWih[rowCount++] = vals;
+        else if (section == SecWhh && rowCount < SecWhh.size()) SecWhh[rowCount++] = vals;
+        else if (section == SecBh && !vals.empty())       SecBh = vals;
     }
     in.close();
     // After loading, upload to device:
