@@ -646,7 +646,7 @@ void Load(const std::string& filename) {
         return;
     }
     std::string line;
-    enum section { NONE, Wih, Whh, Bh } section = NONE;
+    enum section { NONE, SecWih, SecWhh, SecBh } section = NONE;
     int rowCount = 0;
     while (std::getline(in, line)) {
         if (line == "#Wih")           { section = Wih; rowCount = 0; continue; }
