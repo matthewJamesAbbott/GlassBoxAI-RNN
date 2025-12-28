@@ -431,10 +431,9 @@ public:
 
 // ========== TSimpleRNNCell (GPU) ==========
 class TSimpleRNNCell {
-private:
+public:
     int FInputSize, FHiddenSize;
     TActivationType FActivation;
-public:
     TDArray2D Wih, Whh;
     DArray Bh;
     TDArray2D dWih, dWhh;
@@ -543,10 +542,9 @@ public:
 
 // ========== TLSTMCell (GPU-accelerated) ==========
 class TLSTMCell {
-private:
+public:
     int FInputSize, FHiddenSize;
     TActivationType FActivation;
-public:
     TDArray2D Wf, Wi, Wc, Wo;
     DArray Bf, Bi, Bc, Bo;
     TDArray2D dWf, dWi, dWc, dWo;
@@ -744,10 +742,9 @@ public:
 
 // ========== TGRUCell (GPU-accelerated) ==========
 class TGRUCell {
-private:
+public:
     int FInputSize, FHiddenSize;
     TActivationType FActivation;
-public:
     TDArray2D Wz, Wr, Wh;
     DArray Bz, Br, Bh;
     TDArray2D dWz, dWr, dWh;
@@ -923,10 +920,9 @@ public:
 
 // ========== TOutputLayer ==========
 class TOutputLayer {
-private:
+public:
     int FInputSize, FOutputSize;
     TActivationType FActivation;
-public:
     TDArray2D W;
     DArray B;
     TDArray2D dW;
@@ -1009,7 +1005,7 @@ public:
 
 // ========== TAdvancedRNN ==========
 class TAdvancedRNN {
-private:
+public:
     int FInputSize, FOutputSize;
     vector<int> FHiddenSizes;
     TCellType FCellType;
@@ -1024,6 +1020,7 @@ private:
     vector<TLSTMCell*> FLSTMCells;
     vector<TGRUCell*> FGRUCells;
     TOutputLayer* FOutputLayer;
+    TDArray3D FStates;
 
 public:
     TAdvancedRNN(int InputSize, const vector<int>& HiddenSizes, int OutputSize,
@@ -1245,6 +1242,278 @@ public:
         return Result / Outputs.size();
     }
 
+    bool SaveModel(const string& FileName) {
+        try {
+            ofstream File(FileName, ios::binary);
+            if (!File.is_open()) {
+                cerr << "Error: Cannot open file for writing: " << FileName << endl;
+                return false;
+            }
+
+            // Write header and configuration
+            int NumLayers = FHiddenSizes.size();
+            int CellTypeInt = (int)FCellType;
+            int ActTypeInt = (int)FActivation;
+            int OutActTypeInt = (int)FOutputActivation;
+            int LossTypeInt = (int)FLossType;
+
+            File.write((char*)&FInputSize, sizeof(int));
+            File.write((char*)&FOutputSize, sizeof(int));
+            File.write((char*)&NumLayers, sizeof(int));
+            File.write((char*)&CellTypeInt, sizeof(int));
+            File.write((char*)&ActTypeInt, sizeof(int));
+            File.write((char*)&OutActTypeInt, sizeof(int));
+            File.write((char*)&LossTypeInt, sizeof(int));
+            File.write((char*)&FLearningRate, sizeof(double));
+            File.write((char*)&FGradientClip, sizeof(double));
+
+            // Write hidden sizes
+            for (int h : FHiddenSizes)
+                File.write((char*)&h, sizeof(int));
+
+            // Write SimpleRNN cells
+            for (auto cell : FSimpleCells) {
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < cell->FInputSize; j++) {
+                        File.write((char*)&cell->Wih[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < cell->FHiddenSize; j++) {
+                        File.write((char*)&cell->Whh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    File.write((char*)&cell->Bh[i], sizeof(double));
+                }
+            }
+
+            // Write LSTM cells
+            for (auto cell : FLSTMCells) {
+                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.write((char*)&cell->Wf[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.write((char*)&cell->Wi[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.write((char*)&cell->Wc[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.write((char*)&cell->Wo[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    File.write((char*)&cell->Bf[i], sizeof(double));
+                    File.write((char*)&cell->Bi[i], sizeof(double));
+                    File.write((char*)&cell->Bc[i], sizeof(double));
+                    File.write((char*)&cell->Bo[i], sizeof(double));
+                }
+            }
+
+            // Write GRU cells
+            for (auto cell : FGRUCells) {
+                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.write((char*)&cell->Wz[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.write((char*)&cell->Wr[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.write((char*)&cell->Wh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    File.write((char*)&cell->Bz[i], sizeof(double));
+                    File.write((char*)&cell->Br[i], sizeof(double));
+                    File.write((char*)&cell->Bh[i], sizeof(double));
+                }
+            }
+
+            // Write output layer
+            for (int i = 0; i < FOutputSize; i++) {
+                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
+                    File.write((char*)&FOutputLayer->W[i][j], sizeof(double));
+                }
+            }
+            for (int i = 0; i < FOutputSize; i++) {
+                File.write((char*)&FOutputLayer->B[i], sizeof(double));
+            }
+
+            File.close();
+            return true;
+        } catch (...) {
+            cerr << "Error saving model" << endl;
+            return false;
+        }
+    }
+
+    bool LoadModel(const string& FileName) {
+        try {
+            ifstream File(FileName, ios::binary);
+            if (!File.is_open()) {
+                cerr << "Error: File not found: " << FileName << endl;
+                return false;
+            }
+
+            int NumLayers, CellTypeInt, ActTypeInt, OutActTypeInt, LossTypeInt;
+            File.read((char*)&FInputSize, sizeof(int));
+            File.read((char*)&FOutputSize, sizeof(int));
+            File.read((char*)&NumLayers, sizeof(int));
+            File.read((char*)&CellTypeInt, sizeof(int));
+            File.read((char*)&ActTypeInt, sizeof(int));
+            File.read((char*)&OutActTypeInt, sizeof(int));
+            File.read((char*)&LossTypeInt, sizeof(int));
+            File.read((char*)&FLearningRate, sizeof(double));
+            File.read((char*)&FGradientClip, sizeof(double));
+
+            FCellType = (TCellType)CellTypeInt;
+            FActivation = (TActivationType)ActTypeInt;
+            FOutputActivation = (TActivationType)OutActTypeInt;
+            FLossType = (TLossType)LossTypeInt;
+
+            // Read hidden sizes
+            FHiddenSizes.clear();
+            for (int i = 0; i < NumLayers; i++) {
+                int h;
+                File.read((char*)&h, sizeof(int));
+                FHiddenSizes.push_back(h);
+            }
+
+            // Reinitialize cells based on loaded config
+            for (auto cell : FSimpleCells) delete cell;
+            for (auto cell : FLSTMCells) delete cell;
+            for (auto cell : FGRUCells) delete cell;
+            FSimpleCells.clear();
+            FLSTMCells.clear();
+            FGRUCells.clear();
+
+            if (FCellType == ctSimpleRNN) {
+                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
+                    FSimpleCells.push_back(new TSimpleRNNCell(InSize, FHiddenSizes[i], FActivation));
+                }
+            } else if (FCellType == ctLSTM) {
+                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
+                    FLSTMCells.push_back(new TLSTMCell(InSize, FHiddenSizes[i], FActivation));
+                }
+            } else if (FCellType == ctGRU) {
+                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
+                    FGRUCells.push_back(new TGRUCell(InSize, FHiddenSizes[i], FActivation));
+                }
+            }
+
+            if (FOutputLayer) delete FOutputLayer;
+            FOutputLayer = new TOutputLayer(FHiddenSizes.back(), FOutputSize, FOutputActivation);
+
+            // Read SimpleRNN cells
+            for (auto cell : FSimpleCells) {
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < cell->FInputSize; j++) {
+                        File.read((char*)&cell->Wih[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < cell->FHiddenSize; j++) {
+                        File.read((char*)&cell->Whh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    File.read((char*)&cell->Bh[i], sizeof(double));
+                }
+            }
+
+            // Read LSTM cells
+            for (auto cell : FLSTMCells) {
+                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.read((char*)&cell->Wf[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.read((char*)&cell->Wi[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.read((char*)&cell->Wc[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.read((char*)&cell->Wo[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    File.read((char*)&cell->Bf[i], sizeof(double));
+                    File.read((char*)&cell->Bi[i], sizeof(double));
+                    File.read((char*)&cell->Bc[i], sizeof(double));
+                    File.read((char*)&cell->Bo[i], sizeof(double));
+                }
+            }
+
+            // Read GRU cells
+            for (auto cell : FGRUCells) {
+                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.read((char*)&cell->Wz[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.read((char*)&cell->Wr[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    for (int j = 0; j < InputPlusHidden; j++) {
+                        File.read((char*)&cell->Wh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell->FHiddenSize; i++) {
+                    File.read((char*)&cell->Bz[i], sizeof(double));
+                    File.read((char*)&cell->Br[i], sizeof(double));
+                    File.read((char*)&cell->Bh[i], sizeof(double));
+                }
+            }
+
+            // Read output layer
+            for (int i = 0; i < FOutputSize; i++) {
+                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
+                    File.read((char*)&FOutputLayer->W[i][j], sizeof(double));
+                }
+            }
+            for (int i = 0; i < FOutputSize; i++) {
+                File.read((char*)&FOutputLayer->B[i], sizeof(double));
+            }
+
+            File.close();
+            FStates = InitHiddenStates();
+            return true;
+        } catch (...) {
+            cerr << "Error loading model" << endl;
+            return false;
+        }
+    }
+
     void ResetGradients() {
         switch (FCellType) {
             case ctSimpleRNN:
@@ -1309,9 +1578,12 @@ void SplitData(const TDArray2D& Inputs, const TDArray2D& Targets, double ValSpli
 
 // ========== CLI Helpers ==========
 void ShowHelp() {
+    cout << "RNN CUDA - Matthew Abbott 2025" << endl;
+    cout << "Advanced RNN with BPTT, Gradient Clipping, LSTM/GRU, Batch Processing" << endl;
+    cout << endl;
     cout << "Usage: rnn_cuda [OPTIONS]" << endl;
     cout << endl;
-    cout << "Train an RNN on sequence data from CSV files (CUDA accelerated)." << endl;
+    cout << "Training an RNN on sequence data from CSV files (CUDA accelerated)." << endl;
     cout << endl;
     cout << "Options:" << endl;
     cout << "  -h, --help              Show this help message and exit" << endl;
@@ -1319,24 +1591,32 @@ void ShowHelp() {
     cout << "  -t, --target FILE       Target CSV file (required for train)" << endl;
     cout << "  -o, --output FILE       Output predictions to FILE" << endl;
     cout << "  -m, --model FILE        Model file to save/load" << endl;
+    cout << endl;
+    cout << "Model Architecture:" << endl;
     cout << "  --cell TYPE             Cell type: rnn, lstm, gru (default: lstm)" << endl;
     cout << "  --hidden SIZE           Hidden layer size (default: 32)" << endl;
     cout << "  --layers N              Number of hidden layers (default: 1)" << endl;
+    cout << "  --activation TYPE       Hidden activation: sigmoid, tanh, relu (default: tanh)" << endl;
+    cout << "  --out-activation TYPE   Output activation: sigmoid, tanh, relu, linear (default: linear)" << endl;
+    cout << endl;
+    cout << "Training Parameters:" << endl;
     cout << "  --epochs N              Number of training epochs (default: 100)" << endl;
     cout << "  --lr RATE               Learning rate (default: 0.01)" << endl;
     cout << "  --clip VALUE            Gradient clipping value (default: 5.0)" << endl;
     cout << "  --val-split RATIO       Validation split ratio (default: 0.2)" << endl;
-    cout << "  --log-interval N        Log every N epochs (default: 10)" << endl;
-    cout << "  --activation TYPE       Hidden activation: sigmoid, tanh, relu (default: tanh)" << endl;
-    cout << "  --out-activation TYPE   Output activation: sigmoid, tanh, relu, linear (default: linear)" << endl;
     cout << "  --loss TYPE             Loss function: mse, crossentropy (default: mse)" << endl;
+    cout << "  --log-interval N        Log every N epochs (default: 10)" << endl;
     cout << "  --seed N                Random seed (default: random)" << endl;
+    cout << endl;
+    cout << "Inference:" << endl;
     cout << "  --predict               Predict mode (requires --input and --model)" << endl;
+    cout << endl;
+    cout << "Miscellaneous:" << endl;
     cout << "  --quiet                 Suppress progress output" << endl;
     cout << endl;
     cout << "Examples:" << endl;
-    cout << "  rnn_cuda --input data.csv --target labels.csv --epochs 200" << endl;
-    cout << "  rnn_cuda --predict --input test.csv --model model.bin --output predictions.csv" << endl;
+    cout << "  rnn_cuda --input data.csv --target labels.csv --epochs 200 -m model.bin" << endl;
+    cout << "  rnn_cuda --predict --input test.csv -m model.bin --output predictions.csv" << endl;
     cout << endl;
 }
 
@@ -1497,8 +1777,48 @@ int main(int argc, char* argv[]) {
             cerr << "Error: --model is required for prediction" << endl;
             return 1;
         }
-        cerr << "Predict mode not yet implemented (model loading required)" << endl;
-        return 1;
+
+        TAdvancedRNN* RNN = new TAdvancedRNN(
+            InputSize,
+            HiddenSizes,
+            10,  // dummy output size, will be overwritten by LoadModel
+            CellType,
+            Activation,
+            OutActivation,
+            LossType,
+            LearningRate,
+            GradClip,
+            0
+        );
+
+        if (!RNN->LoadModel(ModelFile)) {
+            cerr << "Error: Failed to load model from " << ModelFile << endl;
+            delete RNN;
+            return 1;
+        }
+
+        if (!Quiet)
+            cout << "Model loaded from: " << ModelFile << endl;
+
+        TDArray2D Predictions = RNN->Predict(Inputs);
+        if (!OutputFile.empty()) {
+            SaveCSV(OutputFile, Predictions);
+            if (!Quiet)
+                cout << "Predictions saved to: " << OutputFile << endl;
+        }
+
+        if (!Quiet) {
+            cout << "Predictions:" << endl;
+            for (size_t i = 0; i < Predictions.size() && i < 10; i++) {
+                cout << "  Sample " << i << ": ";
+                for (size_t j = 0; j < Predictions[i].size(); j++) {
+                    cout << fixed << setprecision(6) << Predictions[i][j] << " ";
+                }
+                cout << endl;
+            }
+        }
+
+        delete RNN;
     } else {
         if (TargetFile.empty()) {
             cerr << "Error: --target is required for training" << endl;
@@ -1580,6 +1900,16 @@ int main(int argc, char* argv[]) {
             SaveCSV(OutputFile, Predictions);
             if (!Quiet)
                 cout << "Predictions saved to: " << OutputFile << endl;
+        }
+
+        if (!ModelFile.empty()) {
+            if (RNN->SaveModel(ModelFile)) {
+                if (!Quiet)
+                    cout << "Model saved to: " << ModelFile << endl;
+            } else {
+                if (!Quiet)
+                    cerr << "Warning: Failed to save model to " << ModelFile << endl;
+            }
         }
 
         if (!Quiet)
