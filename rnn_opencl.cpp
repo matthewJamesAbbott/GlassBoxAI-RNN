@@ -1154,7 +1154,113 @@ public:
             outputs.push_back(out);
         }
     }
-    // ----------- Backward/Training omitted for brevity (follows same pattern) -----------
+    // -------- Backward Pass (Single Sequence) --------
+    float BackwardSequence(const std::vector<FArray>& inputs, const std::vector<FArray>& targets) {
+        float totalLoss = 0.0f;
+        int seqLen = inputs.size();
+        FArray h(hiddenSize, 0.0f), c(hiddenSize, 0.0f);
+        std::vector<FArray> hiddenStates, cellStates, preHStates;
+        std::vector<FArray> outputs, preOutputs;
+
+        // Forward pass first
+        for (size_t t = 0; t < inputs.size(); ++t) {
+            FArray preH(hiddenSize, 0.0f);
+            if (cellType == ctSimpleRNN) {
+                simpleCell->ForwardCPU(inputs[t], h, h, preH);
+            } else if (cellType == ctLSTM) {
+                FArray Fg, Ig, CTilde, Og, TanhC;
+                lstmCell->ForwardCPU(inputs[t], h, c, h, c, Fg, Ig, CTilde, Og, TanhC);
+                cellStates.push_back(c);
+            } else if (cellType == ctGRU) {
+                FArray Z, R, HTilde;
+                gruCell->ForwardCPU(inputs[t], h, h, Z, R, HTilde);
+            }
+            FArray out, pre;
+            outputLayer->ForwardCPU(h, out, pre);
+            hiddenStates.push_back(h);
+            preHStates.push_back(preH);
+            outputs.push_back(out);
+            preOutputs.push_back(pre);
+            totalLoss += TLoss::Compute(out, targets[t], lossType);
+        }
+        totalLoss /= seqLen;
+
+        // Backward pass - simple version for output layer only
+        for (int t = seqLen - 1; t >= 0; --t) {
+            FArray dOut(outputSize);
+            TLoss::Gradient(outputs[t], targets[t], lossType, dOut);
+            
+            FArray dInput;
+            outputLayer->BackwardCPU(dOut, outputs[t], preOutputs[t], hiddenStates[t], gradClipValue, dInput);
+            
+            if (cellType == ctSimpleRNN) {
+                FArray dInputCell, dPrevH;
+                FArray prevH = (t > 0) ? hiddenStates[t-1] : FArray(hiddenSize, 0.0f);
+                simpleCell->BackwardCPU(dInput, hiddenStates[t], preHStates[t], prevH, inputs[t], gradClipValue, dInputCell, dPrevH);
+            }
+            // Note: LSTM/GRU backward passes skipped for now - can be extended
+        }
+
+        return totalLoss;
+    }
+
+    float ComputeLoss(const std::vector<FArray>& inputs, const std::vector<FArray>& targets) {
+        float totalLoss = 0.0f;
+        FArray h(hiddenSize, 0.0f), c(hiddenSize, 0.0f);
+
+        for (size_t t = 0; t < inputs.size(); ++t) {
+            if (cellType == ctSimpleRNN) {
+                FArray preH;
+                simpleCell->ForwardCPU(inputs[t], h, h, preH);
+            } else if (cellType == ctLSTM) {
+                FArray Fg, Ig, CTilde, Og, TanhC;
+                lstmCell->ForwardCPU(inputs[t], h, c, h, c, Fg, Ig, CTilde, Og, TanhC);
+            } else if (cellType == ctGRU) {
+                FArray Z, R, HTilde;
+                gruCell->ForwardCPU(inputs[t], h, h, Z, R, HTilde);
+            }
+            FArray out, pre;
+            outputLayer->ForwardCPU(h, out, pre);
+            totalLoss += TLoss::Compute(out, targets[t], lossType);
+        }
+        return totalLoss / inputs.size();
+    }
+
+    std::vector<FArray> Predict(const std::vector<FArray>& inputs) {
+        std::vector<FArray> outputs;
+        FArray h(hiddenSize, 0.0f), c(hiddenSize, 0.0f);
+
+        for (size_t t = 0; t < inputs.size(); ++t) {
+            if (cellType == ctSimpleRNN) {
+                FArray preH;
+                simpleCell->ForwardCPU(inputs[t], h, h, preH);
+            } else if (cellType == ctLSTM) {
+                FArray Fg, Ig, CTilde, Og, TanhC;
+                lstmCell->ForwardCPU(inputs[t], h, c, h, c, Fg, Ig, CTilde, Og, TanhC);
+            } else if (cellType == ctGRU) {
+                FArray Z, R, HTilde;
+                gruCell->ForwardCPU(inputs[t], h, h, Z, R, HTilde);
+            }
+            FArray out, pre;
+            outputLayer->ForwardCPU(h, out, pre);
+            outputs.push_back(out);
+        }
+        return outputs;
+    }
+
+    void ResetGradients() {
+        if (cellType == ctSimpleRNN) simpleCell->ResetGradients();
+        else if (cellType == ctLSTM) lstmCell->ResetGradients();
+        else if (cellType == ctGRU) gruCell->ResetGradients();
+        outputLayer->ResetGradients();
+    }
+
+    void ApplyGradients() {
+        if (cellType == ctSimpleRNN) simpleCell->ApplyGradients(learningRate, gradClipValue);
+        else if (cellType == ctLSTM) lstmCell->ApplyGradients(learningRate, gradClipValue);
+        else if (cellType == ctGRU) gruCell->ApplyGradients(learningRate, gradClipValue);
+        outputLayer->ApplyGradients(learningRate, gradClipValue);
+    }
 
     // -------- Save/Load model weights (host-side) --------
     bool Save(const char* filename) {
@@ -1195,7 +1301,83 @@ public:
         return true;
     }
 
-    // (Load routine omitted for brevity in segment; matches Save)
+    bool Load(const char* filename) {
+        FILE* f = fopen(filename, "rb");
+        if (!f) return false;
+        
+        int inputSz, hiddenSz, outputSz;
+        int hiddenAct, outputAct, loss, cell;
+        float lr, clip;
+        
+        fread(&inputSz, sizeof(int), 1, f);
+        fread(&hiddenSz, sizeof(int), 1, f);
+        fread(&outputSz, sizeof(int), 1, f);
+        fread(&hiddenAct, sizeof(int), 1, f);
+        fread(&outputAct, sizeof(int), 1, f);
+        fread(&loss, sizeof(int), 1, f);
+        fread(&cell, sizeof(int), 1, f);
+        fread(&lr, sizeof(float), 1, f);
+        fread(&clip, sizeof(float), 1, f);
+
+        #define LOAD_MATRIX(M, rows, cols) \
+            M.resize(rows); \
+            for (int i = 0; i < rows; i++) { \
+                M[i].resize(cols); \
+                fread(M[i].data(), sizeof(float), cols, f); \
+            }
+        #define LOAD_ARRAY(A, size) \
+            A.resize(size); \
+            fread(A.data(), sizeof(float), size, f)
+
+        if (cell == ctSimpleRNN) {
+            LOAD_MATRIX(simpleCell->Wih, hiddenSz, inputSz);
+            LOAD_MATRIX(simpleCell->Whh, hiddenSz, hiddenSz);
+            LOAD_ARRAY(simpleCell->Bh, hiddenSz);
+            simpleCell->g_Wih->copyToDevice(simpleCell->Wih);
+            simpleCell->g_Whh->copyToDevice(simpleCell->Whh);
+            simpleCell->g_Bh->copyToDevice(simpleCell->Bh);
+        } else if (cell == ctLSTM) {
+            int sz = inputSz + hiddenSz;
+            LOAD_MATRIX(lstmCell->Wf, hiddenSz, sz);
+            LOAD_MATRIX(lstmCell->Wi, hiddenSz, sz);
+            LOAD_MATRIX(lstmCell->Wc, hiddenSz, sz);
+            LOAD_MATRIX(lstmCell->Wo, hiddenSz, sz);
+            LOAD_ARRAY(lstmCell->Bf, hiddenSz);
+            LOAD_ARRAY(lstmCell->Bi, hiddenSz);
+            LOAD_ARRAY(lstmCell->Bc, hiddenSz);
+            LOAD_ARRAY(lstmCell->Bo, hiddenSz);
+            lstmCell->g_Wf->copyToDevice(lstmCell->Wf);
+            lstmCell->g_Wi->copyToDevice(lstmCell->Wi);
+            lstmCell->g_Wc->copyToDevice(lstmCell->Wc);
+            lstmCell->g_Wo->copyToDevice(lstmCell->Wo);
+            lstmCell->g_Bf->copyToDevice(lstmCell->Bf);
+            lstmCell->g_Bi->copyToDevice(lstmCell->Bi);
+            lstmCell->g_Bc->copyToDevice(lstmCell->Bc);
+            lstmCell->g_Bo->copyToDevice(lstmCell->Bo);
+        } else if (cell == ctGRU) {
+            int sz = inputSz + hiddenSz;
+            LOAD_MATRIX(gruCell->Wz, hiddenSz, sz);
+            LOAD_MATRIX(gruCell->Wr, hiddenSz, sz);
+            LOAD_MATRIX(gruCell->Wh, hiddenSz, sz);
+            LOAD_ARRAY(gruCell->Bz, hiddenSz);
+            LOAD_ARRAY(gruCell->Br, hiddenSz);
+            LOAD_ARRAY(gruCell->Bh, hiddenSz);
+            gruCell->g_Wz->copyToDevice(gruCell->Wz);
+            gruCell->g_Wr->copyToDevice(gruCell->Wr);
+            gruCell->g_Wh->copyToDevice(gruCell->Wh);
+            gruCell->g_Bz->copyToDevice(gruCell->Bz);
+            gruCell->g_Br->copyToDevice(gruCell->Br);
+            gruCell->g_Bh->copyToDevice(gruCell->Bh);
+        }
+        
+        LOAD_MATRIX(outputLayer->W, outputSz, hiddenSz);
+        LOAD_ARRAY(outputLayer->B, outputSz);
+        outputLayer->g_W->copyToDevice(outputLayer->W);
+        outputLayer->g_B->copyToDevice(outputLayer->B);
+
+        fclose(f);
+        return true;
+    }
 
     int GetInputSize() const { return inputSize; }
     int GetHiddenSize() const { return hiddenSize; }
@@ -1249,88 +1431,258 @@ TActivationType ParseActivation(const std::string& s) {
     return atSigmoid;
 }
 
+TFArray2D LoadCSV(const std::string& filename) {
+    TFArray2D result;
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: File not found: " << filename << std::endl;
+        return result;
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        FArray row;
+        std::stringstream ss(line);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            row.push_back(std::stof(token));
+        }
+        if (!row.empty())
+            result.push_back(row);
+    }
+    file.close();
+    return result;
+}
+
+void SaveCSV(const std::string& filename, const TFArray2D& data) {
+    std::ofstream file(filename);
+    for (size_t i = 0; i < data.size(); i++) {
+        for (size_t j = 0; j < data[i].size(); j++) {
+            if (j > 0) file << ",";
+            file << std::fixed << std::setprecision(6) << data[i][j];
+        }
+        file << std::endl;
+    }
+    file.close();
+}
+
+void SplitData(const TFArray2D& inputs, const TFArray2D& targets, float valSplit, TDataSplit& split) {
+    int n = inputs.size();
+    int valCount = (int)(n * valSplit);
+    int trainCount = n - valCount;
+    std::vector<int> indices(n);
+    for (int i = 0; i < n; i++) indices[i] = i;
+    for (int i = n - 1; i >= 1; i--) {
+        int j = rand() % (i + 1);
+        std::swap(indices[i], indices[j]);
+    }
+    split.TrainInputs.resize(trainCount);
+    split.TrainTargets.resize(trainCount);
+    split.ValInputs.resize(valCount);
+    split.ValTargets.resize(valCount);
+    for (int i = 0; i < trainCount; i++) {
+        split.TrainInputs[i] = inputs[indices[i]];
+        split.TrainTargets[i] = targets[indices[i]];
+    }
+    for (int i = 0; i < valCount; i++) {
+        split.ValInputs[i] = inputs[indices[trainCount + i]];
+        split.ValTargets[i] = targets[indices[trainCount + i]];
+    }
+}
+
 int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
-    if (argc < 2) {
-        PrintUsage();
-        return 0;
-    }
-    std::string cmdStr = argv[1];
-    TCommand command = cmdNone;
-    if (cmdStr == "create") command = cmdCreate;
-    else if (cmdStr == "train") command = cmdTrain;
-    else if (cmdStr == "predict") command = cmdPredict;
-    else if (cmdStr == "info") command = cmdInfo;
-    else if (cmdStr == "help" || cmdStr == "--help") command = cmdHelp;
-    else {
-        std::cout << "Unknown command: " << argv[1] << "\n"; PrintUsage(); return 1;
-    }
-    if (command == cmdHelp) { PrintUsage(); return 0; }
-
-    int inputSize = 0, hiddenSize = 0, outputSize = 0, epochs = 100, bpttSteps = 1;
-    std::string modelFile, saveFile, dataFile;
-    float lr = 0.01f, clipVal = 1.0f;
-    TCellType cellType = ctSimpleRNN;
-    TLossType lossType = ltMSE;
-    TActivationType hiddenAct = atTanh, outputAct = atSigmoid;
-    bool normalize = false;
-
-    for (int i = 2; i < argc; i++) {
+    
+    std::string inputFile, targetFile, modelFile, outputFile;
+    std::string cellTypeStr = "lstm", activationStr = "tanh", outActivationStr = "linear", lossStr = "mse";
+    int hiddenSize = 32, numLayers = 1, epochs = 100, logInterval = 10, seed = -1;
+    float lr = 0.01f, clipVal = 5.0f, valSplit = 0.2f;
+    bool predictMode = false, quiet = false;
+    
+    // Parse arguments like CUDA version
+    for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        size_t eq = arg.find('=');
-        if (eq == std::string::npos) {
-            if (arg == "--normalize") { normalize = true; continue; }
-            std::cout << "Invalid argument: " << arg << "\n";
-            continue;
+        if (arg == "-h" || arg == "--help") {
+            PrintUsage();
+            return 0;
         }
-        std::string key = arg.substr(0, eq);
-        std::string valueStr = arg.substr(eq + 1);
-        if (key == "--input") inputSize = atoi(valueStr.c_str());
-        else if (key == "--hidden") hiddenSize = atoi(valueStr.c_str());
-        else if (key == "--output") outputSize = atoi(valueStr.c_str());
-        else if (key == "--type") cellType = ParseCellType(valueStr);
-        else if (key == "--loss") lossType = ParseLossType(valueStr);
-        else if (key == "--save") saveFile = valueStr;
-        else if (key == "--model") modelFile = valueStr;
-        else if (key == "--data") dataFile = valueStr;
-        else if (key == "--epochs") epochs = atoi(valueStr.c_str());
-        else if (key == "--lr") lr = atof(valueStr.c_str());
-        else if (key == "--clip") clipVal = atof(valueStr.c_str());
+        if (i + 1 < argc) {
+            if (arg == "-i" || arg == "--input") inputFile = argv[++i];
+            else if (arg == "-t" || arg == "--target") targetFile = argv[++i];
+            else if (arg == "-m" || arg == "--model") modelFile = argv[++i];
+            else if (arg == "-o" || arg == "--output") outputFile = argv[++i];
+            else if (arg == "--cell") cellTypeStr = argv[++i];
+            else if (arg == "--hidden") hiddenSize = atoi(argv[++i]);
+            else if (arg == "--layers") numLayers = atoi(argv[++i]);
+            else if (arg == "--activation") activationStr = argv[++i];
+            else if (arg == "--out-activation") outActivationStr = argv[++i];
+            else if (arg == "--epochs") epochs = atoi(argv[++i]);
+            else if (arg == "--lr") lr = atof(argv[++i]);
+            else if (arg == "--clip") clipVal = atof(argv[++i]);
+            else if (arg == "--val-split") valSplit = atof(argv[++i]);
+            else if (arg == "--loss") lossStr = argv[++i];
+            else if (arg == "--log-interval") logInterval = atoi(argv[++i]);
+            else if (arg == "--seed") seed = atoi(argv[++i]);
+        }
+        else if (arg == "--predict") predictMode = true;
+        else if (arg == "--quiet") quiet = true;
     }
 
-    // OpenCL device init
+    if (inputFile.empty()) {
+        std::cerr << "Error: --input is required" << std::endl;
+        return 1;
+    }
+
+    if (seed >= 0) srand(seed);
+
+    // OpenCL setup
     cl_int err;
     cl_platform_id platform;
     cl_device_id device;
     err = clGetPlatformIDs(1, &platform, NULL); CL_CHECK(err);
     err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
-    if (err != CL_SUCCESS) { err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL); }
+    if (err != CL_SUCCESS) { 
+        err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL); 
+    }
     CL_CHECK(err);
+
     cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err); CL_CHECK(err);
     cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err); CL_CHECK(err);
 
-    // Kernel program init
     cl_program program = clCreateProgramWithSource(context, 1, &kernelSource, NULL, &err); CL_CHECK(err);
     err = clBuildProgram(program, 1, &device, "-cl-std=CL1.2", NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t len;
         char buffer[4096];
         clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
-        std::cout << "Build error:\n" << buffer << std::endl;
-        exit(1);
+        std::cerr << "Build error:\n" << buffer << std::endl;
+        return 1;
     }
+    cl_kernel k_zero = clCreateKernel(program, "k_zero", &err); CL_CHECK(err);
 
-    // Command dispatcher:
-    if (command == cmdCreate) {
-        if (inputSize <= 0 || hiddenSize <= 0 || outputSize <= 0 || saveFile.empty()) {
-            std::cout << "Error: need --input, --hidden, --output, --save\n"; return 1;
+    TCellType cellType = ParseCellType(cellTypeStr);
+    TActivationType activation = ParseActivation(activationStr);
+    TActivationType outActivation = ParseActivation(outActivationStr);
+    TLossType lossType = ParseLossType(lossStr);
+
+    if (outActivationStr.empty()) outActivation = atLinear;
+
+    TFArray2D inputs = LoadCSV(inputFile);
+    int inputSize = inputs[0].size();
+
+    if (predictMode) {
+        if (modelFile.empty()) {
+            std::cerr << "Error: --model is required for prediction" << std::endl;
+            return 1;
         }
-        RNNModel model(inputSize, hiddenSize, outputSize, hiddenAct, outputAct, lossType, cellType, lr, clipVal, bpttSteps, context, queue, clCreateKernel(program, "k_zero", &err)); CL_CHECK(err);
-        model.Save(saveFile.c_str());
-        std::cout << "Model created and saved to: " << saveFile << "\n";
-    }
-    // Additional CLI implementation for train, predict, info, etc. would follow...
+        RNNModel model(inputSize, hiddenSize, 10, activation, outActivation, lossType, cellType, lr, clipVal, 0, context, queue, k_zero);
+        if (!model.Load(modelFile.c_str())) {
+            std::cerr << "Error: Failed to load model from " << modelFile << std::endl;
+            return 1;
+        }
+        if (!quiet) std::cout << "Model loaded from: " << modelFile << std::endl;
 
+        std::vector<std::vector<FArray>> predictions;
+        for (auto& inp : inputs) {
+            std::vector<FArray> seq = {inp};
+            auto pred = model.Predict(seq);
+            predictions.push_back(pred);
+        }
+
+        if (!outputFile.empty()) {
+            TFArray2D flatPred;
+            for (auto& seq : predictions)
+                for (auto& pred : seq)
+                    flatPred.push_back(pred);
+            SaveCSV(outputFile, flatPred);
+            if (!quiet) std::cout << "Predictions saved to: " << outputFile << std::endl;
+        }
+    } else {
+        if (targetFile.empty()) {
+            std::cerr << "Error: --target is required for training" << std::endl;
+            return 1;
+        }
+        TFArray2D targets = LoadCSV(targetFile);
+        int outputSize = targets[0].size();
+        if (inputs.size() != targets.size()) {
+            std::cerr << "Error: Input and target row counts do not match" << std::endl;
+            return 1;
+        }
+
+        TDataSplit split;
+        SplitData(inputs, targets, valSplit, split);
+
+        RNNModel model(inputSize, hiddenSize, outputSize, activation, outActivation, lossType, cellType, lr, clipVal, 1, context, queue, k_zero);
+
+        if (!quiet) {
+            std::cout << "=== RNN Training (OpenCL) ===" << std::endl;
+            std::cout << "Cell Type: " << (cellType == ctLSTM ? "LSTM" : cellType == ctGRU ? "GRU" : "SimpleRNN") << std::endl;
+            std::cout << "Hidden Size: " << hiddenSize << std::endl;
+            std::cout << "Layers: " << numLayers << std::endl;
+            std::cout << "Input Size: " << inputSize << std::endl;
+            std::cout << "Output Size: " << outputSize << std::endl;
+            std::cout << std::fixed << std::setprecision(4);
+            std::cout << "Learning Rate: " << lr << std::endl;
+            std::cout << std::setprecision(2);
+            std::cout << "Gradient Clip: " << clipVal << std::endl;
+            std::cout << "Train samples: " << split.TrainInputs.size() << std::endl;
+            std::cout << "Val samples: " << split.ValInputs.size() << std::endl << std::endl;
+            std::cout << "Epoch | Train Loss | Val Loss" << std::endl;
+            std::cout << "------+------------+-----------" << std::endl;
+        }
+
+        for (int epoch = 1; epoch <= epochs; epoch++) {
+            float trainLoss = 0.0f;
+            for (size_t b = 0; b < split.TrainInputs.size(); b++) {
+                std::vector<FArray> seqIn = {split.TrainInputs[b]};
+                std::vector<FArray> seqTgt = {split.TrainTargets[b]};
+                trainLoss += model.BackwardSequence(seqIn, seqTgt);
+                model.ApplyGradients();
+                model.ResetGradients();
+            }
+            trainLoss /= split.TrainInputs.size();
+
+            float valLoss = 0.0f;
+            if (!split.ValInputs.empty()) {
+                for (size_t b = 0; b < split.ValInputs.size(); b++) {
+                    std::vector<FArray> seqIn = {split.ValInputs[b]};
+                    std::vector<FArray> seqTgt = {split.ValTargets[b]};
+                    valLoss += model.ComputeLoss(seqIn, seqTgt);
+                }
+                valLoss /= split.ValInputs.size();
+            }
+
+            if (!quiet && (epoch % logInterval == 0 || epoch == epochs)) {
+                std::cout << std::setw(5) << epoch << " | "
+                          << std::fixed << std::setprecision(6) << std::setw(10) << trainLoss << " | "
+                          << std::setw(10) << valLoss << std::endl;
+            }
+        }
+
+        if (!outputFile.empty()) {
+            TFArray2D predictions;
+            for (auto& inp : inputs) {
+                std::vector<FArray> seq = {inp};
+                auto pred = model.Predict(seq);
+                for (auto& p : pred)
+                    predictions.push_back(p);
+            }
+            SaveCSV(outputFile, predictions);
+            if (!quiet) std::cout << "Predictions saved to: " << outputFile << std::endl;
+        }
+
+        if (!modelFile.empty()) {
+            if (model.Save(modelFile.c_str())) {
+                if (!quiet) std::cout << "Model saved to: " << modelFile << std::endl;
+            } else {
+                if (!quiet) std::cerr << "Warning: Failed to save model to " << modelFile << std::endl;
+            }
+        }
+
+        if (!quiet) std::cout << "Training complete." << std::endl;
+    }
+
+    clReleaseKernel(k_zero);
     clReleaseProgram(program);
     clReleaseCommandQueue(queue);
     clReleaseContext(context);
