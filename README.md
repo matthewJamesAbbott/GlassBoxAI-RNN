@@ -2,188 +2,300 @@
 
 **Author:** Matthew Abbott (2025)
 
-This repository contains modern, transparent CUDA implementations of Recurrent Neural Networks (RNNs) for deep learning on the GPU. There are two main modules:
-
-- **rnn.cu:** Direct, advanced CUDA implementation supporting SimpleRNN, LSTM, and GRU with full BPTT and gradient control.
-- **facaded_rnn.cu:** Research/teaching-friendly C++ CUDA RNN facade, exposing high-level yet hackable APIs for analysis, extension, and custom models.
-
-Both modules are designed with **reproducibility, extensibility, and visibility** in mind, offering advanced internals for introspection and gradient debugging.
+GlassBoxAI-RNN is a transparent, research-grade recurrent neural network (RNN) toolkit offering high-performance CUDA and OpenCL implementations for SimpleRNN, LSTM, and GRU cells. The repository includes both a direct, low-level kernel-based implementation and a higher-level facade architecture for advanced introspection and teaching. All four main files can be built from source and run from the command line with abundant options and diagnostics.
 
 ---
 
 ## Table of Contents
 
 - [Features](#features)
+- [Overview of Module Types](#overview-of-module-types)
 - [Requirements](#requirements)
-- [rnn.cu](#rnncu)
-  - [Usage](#usage)
-  - [Arguments](#arguments)
-  - [Public Methods](#public-methods)
-- [facaded_rnn.cu (RNN Facade)](#facaded_rnncu-rnn-facade)
-  - [Usage](#usage-1)
-  - [Arguments](#arguments-1)
-  - [Public Methods](#public-methods-1)
-- [Data Structures](#data-structures)
-- [Overview & Notes](#overview--notes)
+- [Quickstart: Compiling & Running](#quickstart-compiling--running)
+- [CLI Usage and Help](#cli-usage-and-help)
+  - [1. CUDA Command-Line Model (rnn.cu)](#1-cuda-command-line-model-rnncu)
+  - [2. OpenCL Command-Line Model (rnn_opencl.cpp)](#2-opencl-command-line-model-rnn_openclcpp)
+  - [3. CUDA Facade (facaded_rnn.cu)](#3-cuda-facade-facaded_rnncu)
+  - [4. OpenCL Facade (facaded_rnn_opencl.cpp)](#4-opencl-facade-facaded_rnn_openclcpp)
+    - [OpenCL Facade CLI Example](#opencl-facade-cli-example)
+    - [All Facade Introspection Options](#all-facade-introspection-options)
+- [Architecture Notes](#architecture-notes)
+- [Data Structures & Internals](#data-structures--internals)
+- [License](#license)
 
 ---
 
 ## Features
 
-- Supports **SimpleRNN**, **LSTM**, and **GRU** cells on the GPU.
-- Full backpropagation through time (BPTT).
-- Gradient clipping and numerical stability controls.
-- Multiple activation and loss types (sigmoid, tanh, ReLU, MSE, cross-entropy).
-- Batch and sequence processing.
-- Save/load model weights and configurations.
-- Designed for extensibility and introspection for research/education.
-- No external deep learning libraries needed.
+- Pure, dependency-free CUDA (and OpenCL) RNNs: SimpleRNN, LSTM, and GRU
+- **Two styles**:  
+  - **Direct/Kernel RNN** (`rnn.cu`, `rnn_opencl.cpp`): Command-line "raw" models and training
+  - **Facade/Introspectable RNN** (`facaded_rnn.cu`, `facaded_rnn_opencl.cpp`): Research/teaching CLI with advanced inspection tools
+- Support for all popular activation and loss functions, gradient clipping, and introspection
+- Model save/load, flexible sequence length learning, and thorough command-line arguments
+- No external DL frameworks required
+- Designed for transparency, extension, and education
+
+---
+
+## Overview of Module Types
+
+There are **2 x 2 = 4 modes**:
+
+| Type      | Direct/Kernels    | Facade/Introspectable     |
+|-----------|-------------------|---------------------------|
+| CUDA      | `rnn.cu`          | `facaded_rnn.cu`          |
+| OpenCL    | `rnn_opencl.cpp`  | `facaded_rnn_opencl.cpp`  |
+
+**Direct** = command-line, CSV-driven, minimal API  
+**Facade** = research/education, CLI with introspection, model hacking, advanced state control
 
 ---
 
 ## Requirements
 
-- NVIDIA GPU with CUDA support (compute 5.0 or above recommended)
-- CUDA toolkit (tested with CUDA 11+)
-- C++11 or later
-- Optional: CMake (for integrating into larger projects)
+- **CUDA** (for `rnn.cu`, `facaded_rnn.cu`): NVIDIA GPU, CUDA Toolkit 11+, C++11
+- **OpenCL** (for `rnn_opencl.cpp`, `facaded_rnn_opencl.cpp`): Any OpenCL 1.2+ device, C++11
+- **C++ build tools:** g++, nvcc or clang++
+- **Optional:** CMake
 
 ---
 
-## rnn.cu
+## Quickstart: Compiling & Running
 
-### High-Level Description
-
-A direct, "bare-metal" RNN/LSTM/GRU implementation with CUDA for training and inference. Includes:
-
-- Support for variable architecture and sequence length.
-- Matrix and vector math, custom CUDA kernels for all major operations.
-- Flexible selection of activation types, loss types, and cell types at runtime.
-- Gradient accumulation and application, both CPU and GPU.
-- Utilities for I/O and model inspection.
-
-### Usage
-
+**CUDA:**
 ```bash
-nvcc -o rnn_cuda rnn.cu
+# rnn.cu (vanilla CUDA)
+nvcc -O2 -o rnn_cuda rnn.cu
 
-# (Integration into your program or as library code; no built-in CLI driver)
-```
-You are expected to instantiate and drive the RNN (and its cells) via the provided classes and APIs.
-
-### Arguments
-
-#### Model/Constructor Arguments
-
-- `inputSize`: Size of each input vector (**int**)
-- `outputSize`: Output vector size  (**int**)
-- `hiddenSizes`: Vector of ints; arbitrary depths/sizes per hidden layer
-- `cellType`: `ctSimpleRNN`, `ctLSTM`, or `ctGRU`
-- `activation`, `outputActivation`: Activation type enums (`atSigmoid`, `atTanh`, `atReLU`, `atLinear`)
-- `lossType`: `ltMSE` or `ltCrossEntropy`
-- `learningRate`: Training step size (**double**)
-- `gradientClip`: Maximum norm for clipping gradients
-- `bpttSteps`: Number of backpropagation steps
-- `sequenceLen`: Length of input sequence per sample (**int**)
-
-#### Public Methods
-
-- See below per-class descriptions for API details.
-
-### Public Classes and Main Functions
-
-#### Main Classes
-
-- **TSimpleRNNCell**: Basic RNN cell with GPU/CPU forward and backward passes.
-- **TLSTMCell**: LSTM cell with fully GPU-accelerated forward; CPU and GPU hybrid backward.
-- **TGRUCell**: GRU cell, similar architecture to LSTM.
-- **TOutputLayer**: Dense output with selectable activation.
-- **GPUArray/GPUMatrix**: C++ CUDA wrappers for managing device memory.
-
-#### Major Functions (Per Cell Type)
-
-All cells implement at least:
-
-- **Forward**: Calculates hidden/cell state from input and previous state(s).
-  - `void Forward(const DArray& Input, const DArray& PrevH, ...)`
-  - (LSTM/GRU have additional arguments for cell or candidate states.)
-- **Backward**: Computes gradients through the cell given output delta.
-  - `void Backward(...)`
-- **ApplyGradients**: Applies accumulated gradients with clipping and learning rate.
-- **ResetGradients**: Clears gradient accumulators.
-
-#### Other Key API:
-
-- Classes for model persistence, GPU memory management, and activations/loss are included and accessible.
-
----
-
-## facaded_rnn.cu (RNN Facade)
-
-### High-Level Description
-
-A feature-rich, modern C++/CUDA interface to recurrent neural networks, with attention to usability, analysis, and transparency. Supports:
-
-- SimpleRNN, LSTM, GRU cell types.
-- Easy extension to multiple layers and inspection of intermediate results.
-- CUDA-accelerated forward and backward passes.
-- Experimentation with activations, losses, and optimizer states.
-
-### Usage
-
-```bash
+# facaded_rnn.cu (facade CUDA)
 nvcc -O2 -o facaded_rnn_cuda facaded_rnn.cu
 ```
-(intended as a library; see class below for interface)
 
-### Arguments
+**OpenCL:**
+```bash
+# rnn_opencl.cpp (vanilla OpenCL)
+g++ -O2 -std=c++11 -o rnn_opencl rnn_opencl.cpp -lOpenCL
 
-#### Constructor Arguments (Class: `CudaRNNFacade`)
-
-- `inputSize`: Input vector size
-- `outputSize`: Output vector size
-- `hiddenSizes`: `vector<int>`; arbitrary per-layer sizes supported
-- `cellType`: See enum (`ctSimpleRNN`, `ctLSTM`, `ctGRU`)
-- `activation`, `outputActivation`: Activation function types
-- `lossType`: Loss function type
-- `learningRate`: Training rate (default: 0.001)
-- `gradientClip`: Gradient norm clip max (default: 1.0)
-- `bpttSteps`: Steps of BPTT
-- `sequenceLen`: Maximum sequence length
-
-#### Main Methods
-
-- **Forward**: Propagate a sequence/timestep through the network
-  - `Forward(sequence)` / `ForwardStep(input, timestep)`
-- **Backward**: Accumulate gradients and run optimizer
-  - `Backward(sequence, targets)`
-  - `ApplyGradients()`
-- **ResetGradients**
-- **SaveModel(filename) / LoadModel(filename)**
-- **SetTrainingMode(mode: bool)**
-- **Get/Set hidden or cell states**
-- **Introspection/statistics**:
-  - `GetLayerNormStats()`, `GetGradientStats()`, `GetGateStats()`
-  - Access to per-step values, activations, and gates
-
-#### Data Structures
-
-- `DeviceArray`: Utility CUDA host class for array allocation/copy/zero.
-- `CudaSimpleRNNCell`, `CudaLSTMCell`, `CudaGRUCell`, `CudaOutputLayer`: CUDA cell subtypes.
-- `TimeCache`: Keeps history/buffers for sequence passes.
+# facaded_rnn_opencl.cpp (facade OpenCL)
+g++ -O2 -std=c++11 -o facaded_rnn_opencl facaded_rnn_opencl.cpp -lOpenCL
+```
 
 ---
 
-## Data Structures
+## CLI Usage and Help
 
-- **Enumerated types:** ActivationType, LossType, CellType, GateType.
-- **DeviceArray / GPUArray / GPUMatrix**: Host-side and device-side (CUDA) memory wrappers.
-- **Structs:** For statistics—gate saturations, gradient scale, histogram bins, layer normalization.
+Below are usage templates and help for each of the four modes (see also their `--help` output):
+
+---
+
+### 1. CUDA Command-Line Model (`rnn.cu`)
+
+This module provides a basic (but advanced) CLI trainer/inferencer for RNNs, LSTMs, and GRUs using CUDA.
+
+There is **no builtin help command**, but arguments typically follow:
+- `--input input.csv` (input data file)
+- `--target target.csv` (target data file)
+- `--output preds.csv` (optional output file)
+- `--hidden N` (hidden size), `--cell lstm|gru|rnn`
+- `--epochs 100`, `--lr 0.01`, `--clip 5.0`
+- `--model weights.bin` (save/load model)
+- `--predict`, `--quiet`
+
+Example (training):
+```bash
+nvcc -O2 -o rnn_cuda rnn.cu
+./rnn_cuda --input train_x.csv --target train_y.csv --hidden 32 --cell lstm --epochs 100 --output preds.csv --model my_model.bin
+```
+
+Example (predict):
+```bash
+./rnn_cuda --input test_x.csv --model my_model.bin --predict --output preds.csv
+```
+
+---
+
+### 2. OpenCL Command-Line Model (`rnn_opencl.cpp`)
+
+#### Print built-in help:
+```bash
+./rnn_opencl --help
+# or just run with no arguments
+```
+
+#### Example use:
+```bash
+# Train an LSTM with OpenCL:
+./rnn_opencl --input train_x.csv --target train_y.csv --hidden 32 --cell lstm --epochs 100 --output preds.csv --model my_model_opencl.bin
+
+# Predict
+./rnn_opencl --input test_x.csv --model my_model_opencl.bin --predict --output preds.csv
+```
+
+#### Sample Help Output (abridged):
+```
+RNN OpenCL - Command-line Sequence Model (SimpleRNN/LSTM/GRU)
+
+Commands:
+  create      Create a new model
+  train       Train model with data
+  predict     Predict output sequence
+  info        Print model info
+  help        Print usage
+Options:
+  --input=N            Input size
+  --hidden=N           Hidden size
+  --output=N           Output size
+  --cell=simple|lstm|gru   Cell type
+  --loss=mse|ce        Loss function
+  --save=FILE          Save model to file
+  --model=FILE         Model file to load
+  --data=FILE          CSV data file
+  --epochs=N           Training epochs
+  --lr=VALUE           Learning rate
+  --clip=VALUE         Gradient clip value
+  --normalize          Normalize input data
+```
+
+---
+
+### 3. CUDA Facade (`facaded_rnn.cu`)
+
+Facaded, object-oriented C++/CUDA RNN with high-visibility internals for step-by-step hacking, API access, and custom downstream code. Intended for direct integration or scientific research/teaching.
+
+_No stand-alone CLI is bundled by default; typical use is through user C++ driver code, or as a library from an interactive/analysis tool._
+
+**To integrate:**
+```cpp
+#include "facaded_rnn.cu"
+
+// Construct and use the TRNNFacadeCUDA class
+TRNNFacadeCUDA rnn(...);
+rnn.TrainSequence(inputs, targets);
+rnn.Predict(inputs);
+rnn.GetHiddenValue(...);
+```
+
+---
+
+### 4. OpenCL Facade (`facaded_rnn_opencl.cpp`)
+
+A command-line introspectable OpenCL RNN CLI with a rich set of subcommands for model engineering, debugging, and research.
+
+#### Print help:
+```bash
+./facaded_rnn_opencl help
+# or with no args for summary
+./facaded_rnn_opencl
+```
+
+#### Example CLI commands:
+- Create a model:
+    ```bash
+    ./facaded_rnn_opencl create --input-size 10 --hidden-sizes 32,32 --output-size 2 --cell-type gru
+    ```
+- Info:
+    ```bash
+    ./facaded_rnn_opencl info
+    ```
+- Save/load weights:
+    ```bash
+    ./facaded_rnn_opencl save --model-file my_facade.bin
+    ./facaded_rnn_opencl load --model-file my_facade.bin
+    ```
+
+#### OpenCL Facade CLI Example Output:
+```
+RNN Facade CLI (OpenCL GPU) - Matthew Abbott 2025
+
+Usage: facaded_rnn_opencl <command> [options]
+
+Commands:
+  create              Create and initialize an RNN model
+  train               Train the model on data
+  predict             Run prediction on input data
+  save                Save model weights to file
+  load                Load model weights from file
+  info                Display GPU information
+
+Facade Introspection Commands:
+  get-hidden          Get hidden state value
+  set-hidden          Set hidden state value
+  get-output          Get output value at timestep
+  get-cell-state      Get LSTM cell state
+  get-gate            Get gate value (LSTM/GRU)
+  get-preactivation   Get pre-activation value
+  get-input           Get input vector value
+  reset-states        Reset all hidden/cell states
+  set-dropout         Set dropout rate
+  get-dropout         Get current dropout rate
+  detect-vanishing    Check for vanishing gradients
+  detect-exploding    Check for exploding gradients
+  get-seq-outputs     Get all outputs for a sequence
+  get-seq-hidden      Get hidden states over sequence
+
+Create/Train/Predict options:
+  --input-size <n>       Input dimension (required)
+  --hidden-sizes <n,n>   Comma-separated hidden layer sizes (required)
+  --output-size <n>      Output dimension (required)
+  --cell-type <type>     rnn, lstm, or gru (default: lstm)
+  --activation <type>    sigmoid, tanh, relu, linear (default: tanh)
+  --output-activation    Output layer activation (default: sigmoid)
+  --loss <type>          mse or crossentropy (default: mse)
+  --learning-rate <f>    Learning rate (default: 0.01)
+  --gradient-clip <f>    Gradient clipping value (default: 5.0)
+  --bptt-steps <n>       BPTT truncation steps (default: 0 = full)
+  --epochs <n>           Number of training epochs (default: 100)
+  --input-file <file>    CSV file with input sequences
+  --target-file <file>   CSV file with target sequences
+  --output-file <file>   CSV file to write predictions
+
+Facade options:
+  --layer <n>            Layer index (default: 0)
+  --timestep <n>         Timestep index (default: 0)
+  --neuron <n>           Neuron index (default: 0)
+  --output-idx <n>       Output index (default: 0)
+  --value <f>            Value to set
+  --gate <type>          Gate type: forget,input,output,cell,update,reset,hidden
+  --threshold <f>        Threshold for gradient detection (default: 1e-6)
+```
+
+---
+
+#### All Facade Introspection Options
+
+- `get-hidden`, `set-hidden` — Probe/set hidden state at any layer/timestep/neuron
+- `get-output` — Retrieve output at any timestep and index
+- `get-cell-state` — Retrieve LSTM cell state
+- `get-gate` — Inspect value of a gate (LSTM: forget/input/output/cell; GRU: update/reset/hidden)
+- `detect-vanishing`, `detect-exploding` — Test for vanishing/exploding gradients
+- `reset-states`, `set-dropout`, `get-dropout` — Reset/init model state or set dropout
+- `get-seq-outputs` — Print the list of all model outputs for a sequence
+- `get-seq-hidden` — Print the hidden state for a layer across a sequence
+
+---
+
+## Architecture Notes
+
+- **Direct** (`rnn.cu`, `rnn_opencl.cpp`): Lower-abstraction, classic training loops, best for simple or "production" custom scripts.
+- **Facade** (`facaded_rnn.cu`, `facaded_rnn_opencl.cpp`): Designed for deep research, teaching, and introspection—run, hack, and inspect.
+
+All versions are meant to be highly readable and extensible, prioritizing clarity and learning.
+
+---
+
+## Data Structures & Internals
+
+- **Enums:** `TCellType`, `TActivationType`, `TLossType`
+- **Cell classes:** Separate for SimpleRNN, LSTM, GRU, and Output
+- **Memory utilities:** `DeviceArray`, `GPUMatrix`, `CLArray`, etc. for easy CUDA/OpenCL host-device access
+- **Introspection:** All activations, gradients, and network states are accessible to users (especially in the facade builds)
 
 ---
 
 ## License
 
-MIT License, Copyright © 2025 Matthew Abbott
+MIT License  
+© 2025 Matthew Abbott
 
 ---
