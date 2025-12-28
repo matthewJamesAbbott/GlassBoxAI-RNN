@@ -1,1309 +1,1883 @@
 //
+// Facaded RNN
 // Matthew Abbott 2025
 //
-#define CL_TARGET_OPENCL_VERSION 120
-#ifdef __APPLE__
-#include <OpenCL/opencl.h>
-#else
-#include <CL/cl.h>
-#endif
 
 #include <iostream>
 #include <vector>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
-#include <string>
+#include <random>
 #include <algorithm>
 #include <fstream>
 #include <sstream>
-#include <random>
+#include <unordered_map>
 #include <memory>
-#include <iomanip>
+#include <CL/cl.h>
 
-using namespace std;
+// ============================================================================
+// Type Definitions
+// ============================================================================
 
-// OpenCL error check macro, similar to CL_CHECK in rnn_opencl.cpp
-#define CL_CHECK(err) \
-    do { \
-        if (err != CL_SUCCESS) { \
-            std::cerr << "OpenCL error at " << __FILE__ << ":" << __LINE__ << " - " << (int)err << std::endl; \
-            exit(1); \
-        } \
-    } while(0)
+using DArray = std::vector<double>;
+using DArray2D = std::vector<DArray>;
+using DArray3D = std::vector<DArray2D>;
 
-#define BLOCK_SIZE 256
+enum class TActivationType {
+    atSigmoid,
+    atTanh,
+    atReLU,
+    atLinear
+};
 
-// Enums matching CUDA
-enum ActivationType { atSigmoid=0, atTanh=1, atReLU=2, atLinear=3 };
-enum LossType { ltMSE=0, ltCrossEntropy=1 };
-enum CellType { ctSimpleRNN=0, ctLSTM=1, ctGRU=2 };
-enum GateType { gtForget=0, gtInput=1, gtOutput=2, gtCellCandidate=3, gtUpdate=4, gtReset=5, gtHiddenCandidate=6 };
+enum class TLossType {
+    ltMSE,
+    ltCrossEntropy
+};
 
-// Typedefs
-typedef std::vector<float> DArray;
-typedef std::vector<DArray> DArray2D;
-typedef std::vector<DArray2D> DArray3D;
+enum class TCellType {
+    ctSimpleRNN,
+    ctLSTM,
+    ctGRU
+};
 
-struct HistogramBin {
-    float RangeMin, RangeMax;
+enum class TGateType {
+    gtForget,
+    gtInput,
+    gtOutput,
+    gtCellCandidate,
+    gtUpdate,
+    gtReset,
+    gtHiddenCandidate
+};
+
+struct THistogramBin {
+    double RangeMin;
+    double RangeMax;
     int Count;
-    float Percentage;
+    double Percentage;
+};
+using THistogram = std::vector<THistogramBin>;
+
+struct TGateSaturationStats {
+    int NearZeroCount;
+    int NearOneCount;
+    int TotalCount;
+    double NearZeroPct;
+    double NearOnePct;
 };
 
-struct GateSaturationStats {
-    int NearZeroCount, NearOneCount, TotalCount;
-    float NearZeroPct, NearOnePct;
-};
-
-struct GradientScaleStats {
+struct TGradientScaleStats {
     int Timestep;
-    float MeanAbsGrad, MaxAbsGrad, MinAbsGrad;
+    double MeanAbsGrad;
+    double MaxAbsGrad;
+    double MinAbsGrad;
+};
+using TGradientScaleArray = std::vector<TGradientScaleStats>;
+
+struct TLayerNormStats {
+    double Mean;
+    double Variance;
+    double Gamma;
+    double Beta;
 };
 
-struct LayerNormStats {
-    float Mean, Variance, Gamma, Beta;
+struct TOptimizerStateRecord {
+    double Momentum;
+    double Velocity;
+    double Beta1Power;
+    double Beta2Power;
 };
 
-struct OptimizerStateRecord {
-    float Momentum, Velocity, Beta1Power, Beta2Power;
+struct TTimeStepCacheEx {
+    DArray Input;
+    DArray H, C;
+    DArray PreH;
+    DArray F, I, CTilde, O, TanhC;
+    DArray Z, R, HTilde;
+    DArray OutPre, OutVal;
+    DArray DropoutMask;
 };
+using TTimeStepCacheExArray = std::vector<TTimeStepCacheEx>;
 
-static random_device rd;
-static mt19937 gen(rd());
+// ============================================================================
+// OpenCL Utility Class
+// ============================================================================
 
-// Analytics utility functions (host-side, portable from CUDA)
-// E.g. statistics on gradients, gates, activations – use these in train/test loops
-float compute_mean_abs(const std::vector<float>& arr) {
-    float sum = 0.0;
-    for (float v : arr) sum += std::abs(v);
-    return sum / arr.size();
-}
-float compute_max_abs(const std::vector<float>& arr) {
-    float maxv = 0.0;
-    for (float v : arr) maxv = std::max(maxv, std::abs(v));
-    return maxv;
-}
-float compute_min_abs(const std::vector<float>& arr) {
-    float minv = arr.empty() ? 0.0 : std::abs(arr[0]);
-    for (float v : arr) minv = std::min(minv, std::abs(v));
-    return minv;
-}
-
-
-// Double-precision OpenCL kernels mirroring CUDA RNN kernels
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable
-
-const char* kernelSource = R"CLC(
-// --- Device-side activation functions ---
-float d_sigmoid(float x) {
-    float clamped = fmax(-500.0, fmin(500.0, x));
-    return 1.0 / (1.0 + exp(-clamped));
-}
-float d_tanh_act(float x) { return tanh(x); }
-float d_relu(float x) { return x > 0.0 ? x : 0.0; }
-
-float d_apply_activation(float x, int actType) {
-    switch (actType) {
-        case 0: return d_sigmoid(x);
-        case 1: return d_tanh_act(x);
-        case 2: return d_relu(x);
-        case 3: return x;
-        default: return x;
-    }
-}
-float d_activation_derivative(float y, int actType) {
-    switch (actType) {
-        case 0: return y * (1.0 - y);
-        case 1: return 1.0 - y * y;
-        case 2: return y > 0.0 ? 1.0 : 0.0;
-        case 3: return 1.0;
-        default: return 1.0;
-    }
-}
-float d_clip_value(float v, float maxVal) {
-    if (v > maxVal) return maxVal;
-    if (v < -maxVal) return -maxVal;
-    return v;
-}
-// ------- Basic kernels -------
-
-// Vector addition: C = A + B
-__kernel void k_vec_add(__global float* C, __global const float* A, __global const float* B, int n) {
-    int idx = get_global_id(0);
-    if (idx < n)
-        C[idx] = A[idx] + B[idx];
-}
-
-// Vector scale: A = A * scale
-__kernel void k_vec_scale(__global float* A, float scale, int n) {
-    int idx = get_global_id(0);
-    if (idx < n)
-        A[idx] *= scale;
-}
-
-// Zero array
-__kernel void k_zero_array(__global float* A, int n) {
-    int idx = get_global_id(0);
-    if (idx < n)
-        A[idx] = 0.0;
-}
-
-// Fill array with value
-__kernel void k_fill_array(__global float* A, float val, int n) {
-    int idx = get_global_id(0);
-    if (idx < n)
-        A[idx] = val;
-}
-
-// Matrix-vector multiply: y = W * x + b, then apply activation
-// W is [rows x cols], x [cols], y [rows], b [rows]
-__kernel void k_matvec_bias_act(__global float* y, __global const float* W, __global const float* x,
-                                __global const float* b, int rows, int cols, int actType) {
-    int row = get_global_id(0);
-    if (row < rows) {
-        float sum = b[row];
-        for (int j = 0; j < cols; j++) {
-            sum += W[row * cols + j] * x[j];
-        }
-        y[row] = d_apply_activation(sum, actType);
-    }
-}
-
-// Matrix-vector multiply, no activation: y = W * x + b
-__kernel void k_matvec_bias(__global float* y, __global const float* W, __global const float* x,
-                            __global const float* b, int rows, int cols) {
-    int row = get_global_id(0);
-    if (row < rows) {
-        float sum = b[row];
-        for (int j = 0; j < cols; j++)
-            sum += W[row * cols + j] * x[j];
-        y[row] = sum;
-    }
-}
-
-// Concatenate two vectors: out = [a, b]
-__kernel void k_concat(__global float* out, __global const float* a, __global const float* b, int sizeA, int sizeB) {
-    int idx = get_global_id(0);
-    if (idx < sizeA)
-        out[idx] = a[idx];
-    else if (idx < sizeA + sizeB)
-        out[idx] = b[idx - sizeA];
-}
-
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable
-
-// --- SimpleRNN cell forward (per timestep) ---
-__kernel void k_simple_rnn_forward(__global float* H, __global float* PreH,
-    __global const float* Wih, __global const float* Whh, __global const float* Bh,
-    __global const float* Input, __global const float* PrevH,
-    int inputSize, int hiddenSize, int actType) {
-
-    int i = get_global_id(0);
-    if (i < hiddenSize) {
-        float sum = Bh[i];
-        for (int j = 0; j < inputSize; j++)
-            sum += Wih[i * inputSize + j] * Input[j];
-        for (int j = 0; j < hiddenSize; j++)
-            sum += Whh[i * hiddenSize + j] * PrevH[j];
-        PreH[i] = sum;
-        H[i] = d_apply_activation(sum, actType);
-    }
-}
-
-// --- SimpleRNN backward: dHRaw, weight/bias grads, dInput, dPrevH ---
-
-__kernel void k_simple_rnn_backward_dHRaw(__global float* dHRaw, __global const float* dH,
-                                          __global const float* H, int hiddenSize,
-                                          int actType, float clipVal) {
-    int i = get_global_id(0);
-    if (i < hiddenSize) {
-        float deriv;
-        switch (actType) {
-            case 0: deriv = H[i] * (1.0 - H[i]); break;        // sigmoid
-            case 1: deriv = 1.0 - H[i]*H[i]; break;            // tanh
-            case 2: deriv = H[i] > 0.0 ? 1.0 : 0.0; break;     // ReLU
-            default: deriv = 1.0;
-        }
-        float raw = dH[i] * deriv;
-        dHRaw[i] = (raw >  clipVal) ?  clipVal :
-                   (raw < -clipVal) ? -clipVal : raw;
-    }
-}
-
-__kernel void k_accumulate_dW(__global float* dW, __global const float* dHRaw, __global const float* X,
-                              int rows, int cols) {
-    int idx = get_global_id(0);
-    int total = rows * cols;
-    if (idx < total) {
-        int i = idx / cols;
-        int j = idx % cols;
-        // WARNING: OpenCL 1.x does NOT guarantee atomic add on float
-        // Host-side reduction recommended for real BPTT!
-        dW[idx] += dHRaw[i] * X[j];
-    }
-}
-
-__kernel void k_accumulate_dB(__global float* dB, __global const float* dHRaw, int size) {
-    int i = get_global_id(0);
-    if (i < size)
-        dB[i] += dHRaw[i];
-}
-
-__kernel void k_compute_dInput(__global float* dInput, __global const float* W, __global const float* dHRaw,
-                               int inputSize, int hiddenSize) {
-    int j = get_global_id(0);
-    if (j < inputSize) {
-        float sum = 0.0;
-        for (int i = 0; i < hiddenSize; ++i)
-            sum += W[i * inputSize + j] * dHRaw[i];
-        dInput[j] = sum;
-    }
-}
-
-__kernel void k_compute_dPrevH(__global float* dPrevH, __global const float* Whh, __global const float* dHRaw,
-                               int hiddenSize) {
-    int j = get_global_id(0);
-    if (j < hiddenSize) {
-        float sum = 0.0;
-        for (int i = 0; i < hiddenSize; ++i)
-            sum += Whh[i * hiddenSize + j] * dHRaw[i];
-        dPrevH[j] = sum;
-    }
-}
-
-// --- LSTM cell forward (per timestep) ---
-__kernel void k_lstm_forward(__global float* H, __global float* C, __global float* FG, __global float* IG,
-    __global float* CTilde, __global float* OG, __global float* TanhC,
-    __global const float* Wf, __global const float* Wi, __global const float* Wc, __global const float* Wo,
-    __global const float* Bf, __global const float* Bi, __global const float* Bc, __global const float* Bo,
-    __global const float* Concat, __global const float* PrevC,
-    int concatSize, int hiddenSize) {
-
-    int k = get_global_id(0);
-    if (k < hiddenSize) {
-        float sumF = Bf[k], sumI = Bi[k], sumC = Bc[k], sumO = Bo[k];
-        for (int j = 0; j < concatSize; j++) {
-            float cj = Concat[j];
-            sumF += Wf[k * concatSize + j] * cj;
-            sumI += Wi[k * concatSize + j] * cj;
-            sumC += Wc[k * concatSize + j] * cj;
-            sumO += Wo[k * concatSize + j] * cj;
-        }
-        FG[k]     = d_sigmoid(sumF);
-        IG[k]     = d_sigmoid(sumI);
-        CTilde[k] = d_tanh_act(sumC);
-        OG[k]     = d_sigmoid(sumO);
-        C[k]      = FG[k] * PrevC[k] + IG[k] * CTilde[k];
-        TanhC[k]  = tanh(C[k]);
-        H[k]      = OG[k] * TanhC[k];
-    }
-}
-
-// --- GRU cell forward part 1: Z/R gates ---
-__kernel void k_gru_forward_gates(__global float* Z, __global float* R,
-    __global const float* Wz, __global const float* Wr,
-    __global const float* Bz, __global const float* Br,
-    __global const float* Concat,
-    int concatSize, int hiddenSize) {
-
-    int k = get_global_id(0);
-    if (k < hiddenSize) {
-        float sumZ = Bz[k], sumR = Br[k];
-        for (int j = 0; j < concatSize; j++) {
-            sumZ += Wz[k * concatSize + j] * Concat[j];
-            sumR += Wr[k * concatSize + j] * Concat[j];
-        }
-        Z[k] = d_sigmoid(sumZ);
-        R[k] = d_sigmoid(sumR);
-    }
-}
-
-// --- GRU cell forward part 2: HTilde/H ---
-__kernel void k_gru_forward_hidden(__global float* H, __global float* HTilde,
-    __global const float* Wh, __global const float* Bh,
-    __global const float* Input, __global const float* PrevH,
-    __global const float* Z, __global const float* R,
-    int inputSize, int hiddenSize) {
-
-    int k = get_global_id(0);
-    if (k < hiddenSize) {
-        int concatSize = inputSize + hiddenSize;
-        float sumH = Bh[k];
-        // Input part
-        for (int j = 0; j < inputSize; j++)
-            sumH += Wh[k * concatSize + j] * Input[j];
-        // Reset-gated hidden part
-        for (int j = 0; j < hiddenSize; j++)
-            sumH += Wh[k * concatSize + inputSize + j] * (R[j] * PrevH[j]);
-
-        HTilde[k] = d_tanh_act(sumH);
-        H[k] = (1.0 - Z[k]) * PrevH[k] + Z[k] * HTilde[k];
-    }
-}
-
-// --- Output layer forward: y = W*x+B, then activation
-__kernel void k_output_forward(__global float* Output, __global float* Pre,
-    __global const float* W, __global const float* B,
-    __global const float* Input,
-    int inputSize, int outputSize, int actType) {
-
-    int i = get_global_id(0);
-    if (i < outputSize) {
-        float sum = B[i];
-        for (int j = 0; j < inputSize; j++)
-            sum += W[i * inputSize + j] * Input[j];
-        Pre[i] = sum;
-        Output[i] = d_apply_activation(sum, actType);
-    }
-}
-
-
-// ===================== LSTM Backward Kernels =====================
-
-// Compute LSTM gate derivatives (for BPTT)
-__kernel void k_lstm_backward_gates(
-    __global float* dOG, __global float* dCTotal, __global float* dFG,
-    __global float* dIG, __global float* dCTilde,
-    __global const float* dH, __global const float* dC,
-    __global const float* FG, __global const float* IG,
-    __global const float* CTilde, __global const float* OG,
-    __global const float* TanhC, __global const float* PrevC,
-    int hiddenSize, float clipVal)
-{
-    int k = get_global_id(0);
-    if (k < hiddenSize) {
-        float og = OG[k], tanhc = TanhC[k];
-        float fg = FG[k], ig = IG[k], ct = CTilde[k], pc = PrevC[k];
-
-        float raw_og = dH[k] * tanhc * og * (1.0 - og);
-        dOG[k] = (raw_og >  clipVal) ?  clipVal : ((raw_og < -clipVal) ? -clipVal : raw_og);
-
-        float dcTotal = dH[k] * og * (1.0 - tanhc * tanhc) + dC[k];
-        dcTotal = (dcTotal > clipVal) ? clipVal : ((dcTotal < -clipVal) ? -clipVal : dcTotal);
-        dCTotal[k] = dcTotal;
-
-        float raw_fg = dcTotal * pc * fg * (1.0 - fg);
-        dFG[k] = (raw_fg >  clipVal) ?  clipVal : ((raw_fg < -clipVal) ? -clipVal : raw_fg);
-
-        float raw_ig = dcTotal * ct * ig * (1.0 - ig);
-        dIG[k] = (raw_ig >  clipVal) ?  clipVal : ((raw_ig < -clipVal) ? -clipVal : raw_ig);
-
-        float raw_cTilde = dcTotal * ig * (1.0 - ct * ct);
-        dCTilde[k] = (raw_cTilde >  clipVal) ?  clipVal : ((raw_cTilde < -clipVal) ? -clipVal : raw_cTilde);
-    }
-}
-
-__kernel void k_lstm_backward_dPrevC(__global float* dPrevC, __global const float* dCTotal,
-                                     __global const float* FG, int hiddenSize) {
-    int k = get_global_id(0);
-    if (k < hiddenSize)
-        dPrevC[k] = dCTotal[k] * FG[k];}
-
-    // Accumulate dW, dB (host-side reduction recommended in production)
-__kernel void k_lstm_backward_weights(
-   __global float* dWf, __global float* dWi, __global float* dWc, __global float* dWo,
-   __global float* dBf, __global float* dBi, __global float* dBc, __global float* dBo,
-   __global const float* dFG, __global const float* dIG,
-   __global const float* dCTilde, __global const float* dOG,
-   __global const float* Concat,
-   int hiddenSize, int concatSize)
-   {
-      int idx = get_global_id(0);
-      int total = hiddenSize * concatSize;
-      if (idx < total) {
-         int k = idx / concatSize;
-         int j = idx % concatSize;
-         float cj = Concat[j];
-         dWf[idx] += dFG[k] * cj;
-         dWi[idx] += dIG[k] * cj;
-         dWc[idx] += dCTilde[k] * cj;
-         dWo[idx] += dOG[k] * cj;
-      }
-
-     // For bias, just let first hiddenSize threads do this
-     if (idx < hiddenSize) {
-        dBf[idx] += dFG[idx];
-        dBi[idx] += dIG[idx];
-        dBc[idx] += dCTilde[idx];
-        dBo[idx] += dOG[idx];
-     }
-}
-
-// dInput and dPrevH computation
-__kernel void k_lstm_backward_dInput_dPrevH(
-   __global float* dInput, __global float* dPrevH,
-   __global const float* Wf, __global const float* Wi,
-   __global const float* Wc, __global const float* Wo,
-   __global const float* dFG, __global const float* dIG,
-   __global const float* dCTilde, __global const float* dOG,
-   int inputSize, int hiddenSize, int concatSize)
-   {
-      int j = get_global_id(0);
-      if (j < concatSize) {
-         float sum = 0.0;
-         for (int k = 0; k < hiddenSize; k++) {
-            int idx = k * concatSize + j;
-            sum += Wf[idx] * dFG[k] +
-            Wi[idx] * dIG[k] +
-            Wc[idx] * dCTilde[k] +
-            Wo[idx] * dOG[k];
-         }
-         if (j < inputSize)
-            dInput[j] = sum;
-         else
-            dPrevH[j - inputSize] = sum;
-      }
-   }
-   )CLC";
-
-/*
- * Device buffer handle and helpers (for float precision OpenCL, facade style)
- * Analogous to DeviceArray (CUDA) and CLArray (rnn_opencl.cpp, but float)
- */
-
-class CLArray {
-public:
-    cl_mem d_ptr;
-    int size;
+class OpenCLUtil {
+private:
+    cl_platform_id platform;
+    cl_device_id device;
     cl_context context;
     cl_command_queue queue;
+    bool initialized;
 
-    CLArray(cl_context ctx, cl_command_queue q)
-        : d_ptr(nullptr), size(0), context(ctx), queue(q) {}
-
-    void allocate(int n) {
-        cl_int err;
-        if (d_ptr) clReleaseMemObject(d_ptr);
-        d_ptr = nullptr;
-        if (n > 0) {
-            d_ptr = clCreateBuffer(context, CL_MEM_READ_WRITE, n * sizeof(float), NULL, &err);
-            CL_CHECK(err);
-            size = n;
-        }
-    }
-
-    void free() {
-        if (d_ptr) {
-            clReleaseMemObject(d_ptr);
-            d_ptr = nullptr;
-        }
-        size = 0;
-    }
-
-    void zero(cl_kernel k_zero_kernel) {
-        if (d_ptr && size > 0) {
-            size_t globalSize = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            clSetKernelArg(k_zero_kernel, 0, sizeof(cl_mem), &d_ptr);
-            clSetKernelArg(k_zero_kernel, 1, sizeof(int), &size);
-            cl_int err = clEnqueueNDRangeKernel(queue, k_zero_kernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
-            CL_CHECK(err);
-            clFinish(queue);
-        }
-    }
-
-    void copyToDevice(const DArray& src) {
-        allocate((int)src.size());
-        cl_int err = clEnqueueWriteBuffer(queue, d_ptr, CL_TRUE, 0, src.size() * sizeof(float), src.data(), 0, NULL, NULL);
-        // CL_CHECK(err);
-    }
-
-    void copyToHost(DArray& dst) {
-        dst.resize(size);
-        cl_int err = clEnqueueReadBuffer(queue, d_ptr, CL_TRUE, 0, size * sizeof(float), dst.data(), 0, NULL, NULL);
-        CL_CHECK(err);
-    }
-
-    void copyToDeviceRaw(const float* src, int n) {
-        allocate(n);
-        cl_int err = clEnqueueWriteBuffer(queue, d_ptr, CL_TRUE, 0, n * sizeof(float), src, 0, NULL, NULL);
-        CL_CHECK(err);
-    }
-
-    // fill entire array with value (calls kernel)
-    void fill(cl_kernel k_fill, float val) {
-        if (!d_ptr || size <= 0) return;
-        size_t globalSize = ((size + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-        clSetKernelArg(k_fill, 0, sizeof(cl_mem), &d_ptr);
-        clSetKernelArg(k_fill, 1, sizeof(float), &val);
-        clSetKernelArg(k_fill, 2, sizeof(int), &size);
-        cl_int err = clEnqueueNDRangeKernel(queue, k_fill, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
-        CL_CHECK(err);
-        clFinish(queue);
-    }
-
-    ~CLArray() { free(); }
-};
-
-class SimpleRNNCell {
 public:
-    int inputSize, hiddenSize;
-    ActivationType activation;
+    OpenCLUtil() : initialized(false) {}
 
-    // Host-side weights (float, for precision)
-    DArray2D Wih, Whh;
-    DArray Bh, dBh;
-    DArray2D dWih, dWhh;
+    ~OpenCLUtil() {
+        cleanup();
+    }
 
-    // Device-side buffers
-    std::unique_ptr<CLArray> g_Wih, g_Whh, g_Bh;
-    std::unique_ptr<CLArray> g_dWih, g_dWhh, g_dBh;
-    std::unique_ptr<CLArray> g_H, g_PreH, g_Input, g_PrevH;
+    bool initialize(bool verbose = true) {
+        try {
+            cl_int err;
 
-    cl_context context;
-    cl_command_queue queue;
-
-    // SimpleRNNCell initialization
-    SimpleRNNCell(int inputSize_, int hiddenSize_, ActivationType activation_,
-                  cl_context ctx, cl_command_queue q,
-                  cl_kernel k_zero_kernel)
-        : inputSize(inputSize_), hiddenSize(hiddenSize_), activation(activation_),
-          context(ctx), queue(q)
-    {
-        float scale = std::sqrt(2.0 / (inputSize + hiddenSize));
-        // Initialize and zero host weights (float)
-        auto initMat = [&](DArray2D& M, int rows, int cols, float sc) {
-            std::uniform_real_distribution<> dis(-sc, sc);
-            M.resize(rows);
-            for (int i = 0; i < rows; ++i) {
-                M[i].resize(cols);
-                for (int j = 0; j < cols; ++j)
-                    M[i][j] = dis(gen);
+            err = clGetPlatformIDs(1, &platform, nullptr);
+            if (err != CL_SUCCESS) {
+                if (verbose) std::cerr << "Failed to get platform: " << err << std::endl;
+                return false;
             }
-        };
-        auto zeroMat = [](DArray2D& M, int rows, int cols) {
-            M.resize(rows); for (int i = 0; i < rows; ++i) M[i].assign(cols, 0.0);
-        };
-        auto zeroArr = [](DArray& A, int sz) { A.assign(sz, 0.0); };
 
-        initMat(Wih, hiddenSize, inputSize, scale);
-        initMat(Whh, hiddenSize, hiddenSize, scale);
-        zeroArr(Bh, hiddenSize);
+            err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
+            if (err != CL_SUCCESS) {
+                err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, nullptr);
+                if (err != CL_SUCCESS) {
+                    if (verbose) std::cerr << "Failed to get device: " << err << std::endl;
+                    return false;
+                }
+                if (verbose) std::cout << "Using CPU device" << std::endl;
+            } else {
+                if (verbose) std::cout << "Using GPU device" << std::endl;
+            }
 
-        zeroMat(dWih, hiddenSize, inputSize);
-        zeroMat(dWhh, hiddenSize, hiddenSize);
-        zeroArr(dBh, hiddenSize);
+            context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
+            if (err != CL_SUCCESS) {
+                if (verbose) std::cerr << "Failed to create context: " << err << std::endl;
+                return false;
+            }
 
-        g_Wih  = std::make_unique<CLArray>(context, queue);
-        g_Whh  = std::make_unique<CLArray>(context, queue);
-        g_Bh   = std::make_unique<CLArray>(context, queue);
-        g_dWih = std::make_unique<CLArray>(context, queue);
-        g_dWhh = std::make_unique<CLArray>(context, queue);
-        g_dBh  = std::make_unique<CLArray>(context, queue);
+            #ifdef CL_VERSION_2_0
+                cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, 0, 0};
+                queue = clCreateCommandQueueWithProperties(context, device, props, &err);
+            #else
+                queue = clCreateCommandQueue(context, device, 0, &err);
+            #endif
+            if (err != CL_SUCCESS) {
+                if (verbose) std::cerr << "Failed to create command queue: " << err << std::endl;
+                clReleaseContext(context);
+                return false;
+            }
 
-        // allocate and upload weight buffers
-        int idx;
-        std::vector<float> w_tmp(hiddenSize * inputSize);  // flatten for OpenCL
-        for (int i=0, idx=0; i < hiddenSize; ++i)
-            for (int j=0; j < inputSize; ++j)
-                w_tmp[idx++] = Wih[i][j];
-        g_Wih->allocate(hiddenSize * inputSize);
-        g_Wih->copyToDevice(w_tmp);
+            if (verbose) {
+                char name[256] = {0};
+                clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+                std::cout << "OpenCL device: " << name << std::endl;
+                
+                cl_ulong mem_size;
+                clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(mem_size), &mem_size, nullptr);
+                std::cout << "GPU Global Memory: " << (mem_size / (1024UL * 1024UL * 1024UL)) << " GB" << std::endl;
+                std::cout << "OpenCL initialized successfully" << std::endl;
+            }
 
-        w_tmp.resize(hiddenSize * hiddenSize); idx = 0;
-        for (int i=0; i < hiddenSize; ++i)
-            for (int j=0; j < hiddenSize; ++j)
-                w_tmp[idx++] = Whh[i][j];
-        g_Whh->allocate(hiddenSize * hiddenSize);
-        g_Whh->copyToDevice(w_tmp);
-
-        g_Bh->copyToDevice(Bh);
-
-        g_dWih->allocate(hiddenSize * inputSize); g_dWih->zero(k_zero_kernel);
-        g_dWhh->allocate(hiddenSize * hiddenSize); g_dWhh->zero(k_zero_kernel);
-        g_dBh->allocate(hiddenSize); g_dBh->zero(k_zero_kernel);
-
-        // temporaries
-        g_H    = std::make_unique<CLArray>(context, queue); g_H->allocate(hiddenSize);
-        g_PreH = std::make_unique<CLArray>(context, queue); g_PreH->allocate(hiddenSize);
-        g_Input= std::make_unique<CLArray>(context, queue);
-        g_PrevH= std::make_unique<CLArray>(context, queue);
+            initialized = true;
+            return true;
+        } catch (...) {
+            return false;
+        }
     }
 
-    void ForwardOpenCL(const DArray& input, const DArray& prevH,
-                       DArray& H, DArray& PreH,
-                       cl_kernel k_forward) {
-        // upload input/prevH
-        g_Input->copyToDevice(input);
-        g_PrevH->copyToDevice(prevH);
+    cl_program createProgram(const std::string& source) {
+        if (!initialized) return nullptr;
 
-        // Set kernel arguments and enqueue
-        int i = 0;
-        clSetKernelArg(k_forward, i++, sizeof(cl_mem), &g_H->d_ptr);
-        clSetKernelArg(k_forward, i++, sizeof(cl_mem), &g_PreH->d_ptr);
-        clSetKernelArg(k_forward, i++, sizeof(cl_mem), &g_Wih->d_ptr);
-        clSetKernelArg(k_forward, i++, sizeof(cl_mem), &g_Whh->d_ptr);
-        clSetKernelArg(k_forward, i++, sizeof(cl_mem), &g_Bh->d_ptr);
-        clSetKernelArg(k_forward, i++, sizeof(cl_mem), &g_Input->d_ptr);
-        clSetKernelArg(k_forward, i++, sizeof(cl_mem), &g_PrevH->d_ptr);
-        clSetKernelArg(k_forward, i++, sizeof(int), &inputSize);
-        clSetKernelArg(k_forward, i++, sizeof(int), &hiddenSize);
-        int actT = (int)activation;
-        clSetKernelArg(k_forward, i++, sizeof(int), &actT);
+        cl_int err;
+        const char* src = source.c_str();
+        size_t len = source.length();
 
-        size_t global = ((hiddenSize + BLOCK_SIZE - 1)/BLOCK_SIZE)*BLOCK_SIZE;
-        cl_int err = clEnqueueNDRangeKernel(queue, k_forward, 1, NULL, &global, NULL, 0, NULL, NULL);
-        CL_CHECK(err);
-        clFinish(queue);
+        cl_program program = clCreateProgramWithSource(context, 1, &src, &len, &err);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to create program: " << err << std::endl;
+            return nullptr;
+        }
 
-        // Download output & preactivation from device
-        g_H->copyToHost(H);
-        g_PreH->copyToHost(PreH);
+        err = clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to build program: " << err << std::endl;
+            
+            size_t log_size;
+            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+            std::vector<char> log(log_size);
+            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+            std::cerr << "Build log:\n" << std::string(log.begin(), log.end()) << std::endl;
+            
+            clReleaseProgram(program);
+            return nullptr;
+        }
+
+        return program;
     }
 
-    int GetHiddenSize() const { return hiddenSize; }
+    cl_kernel createKernel(cl_program program, const std::string& kernel_name) {
+        if (!initialized) return nullptr;
 
-    // Add other methods for backward pass and weights application as needed (adapted from CUDA & OpenCL base)
+        cl_int err;
+        cl_kernel kernel = clCreateKernel(program, kernel_name.c_str(), &err);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to create kernel '" << kernel_name << "': " << err << std::endl;
+            return nullptr;
+        }
+        return kernel;
+    }
+
+    cl_mem createBuffer(size_t size, cl_mem_flags flags = CL_MEM_READ_WRITE) {
+        if (!initialized) return nullptr;
+
+        cl_int err;
+        cl_mem buffer = clCreateBuffer(context, flags, size, nullptr, &err);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to create buffer of size " << size << ": " << err << std::endl;
+            return nullptr;
+        }
+        return buffer;
+    }
+
+    bool writeBuffer(cl_mem buffer, size_t size, const void* data) {
+        if (!initialized) return false;
+
+        cl_int err = clEnqueueWriteBuffer(queue, buffer, CL_TRUE, 0, size, data, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to write buffer: " << err << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    bool readBuffer(cl_mem buffer, size_t size, void* data) {
+        if (!initialized) return false;
+
+        cl_int err = clEnqueueReadBuffer(queue, buffer, CL_TRUE, 0, size, data, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to read buffer: " << err << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    bool finish() {
+        if (!initialized) return false;
+
+        cl_int err = clFinish(queue);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to finish queue: " << err << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    cl_context getContext() const { return context; }
+    cl_command_queue getQueue() const { return queue; }
+    cl_device_id getDevice() const { return device; }
+    bool isInitialized() const { return initialized; }
+
+    void cleanup() {
+        if (queue) clReleaseCommandQueue(queue);
+        if (context) clReleaseContext(context);
+    }
 };
 
-class LSTMCell {
-public:
-    int inputSize, hiddenSize, concatSize;
-    ActivationType activation;
-    cl_context context;
-    cl_command_queue queue;
+// ============================================================================
+// GPU Buffer Classes
+// ============================================================================
 
-    // Host-side weights & gradients
+class GPUBuffer {
+private:
+    cl_mem buffer;
+    size_t size;
+    OpenCLUtil* opencl;
+
+public:
+    GPUBuffer(OpenCLUtil* ocl, size_t sz) : opencl(ocl), size(sz) {
+        buffer = opencl->createBuffer(sz * sizeof(double));
+    }
+
+    ~GPUBuffer() {
+        if (buffer) clReleaseMemObject(buffer);
+    }
+
+    void upload(const double* data) {
+        opencl->writeBuffer(buffer, size * sizeof(double), data);
+    }
+
+    void download(double* data) {
+        opencl->readBuffer(buffer, size * sizeof(double), data);
+    }
+
+    cl_mem getHandle() const { return buffer; }
+    size_t getSize() const { return size; }
+    bool isValid() const { return buffer != nullptr; }
+};
+
+class GPUMatrix {
+private:
+    cl_mem buffer;
+    int rows, cols;
+    OpenCLUtil* opencl;
+
+public:
+    GPUMatrix(OpenCLUtil* ocl, int r, int c) 
+        : opencl(ocl), rows(r), cols(c) {
+        buffer = opencl->createBuffer(r * c * sizeof(double));
+    }
+
+    ~GPUMatrix() {
+        if (buffer) clReleaseMemObject(buffer);
+    }
+
+    void upload(const DArray2D& data) {
+        std::vector<double> flat(rows * cols);
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                flat[i * cols + j] = data[i][j];
+            }
+        }
+        opencl->writeBuffer(buffer, rows * cols * sizeof(double), flat.data());
+    }
+
+    void download(DArray2D& data) {
+        std::vector<double> flat(rows * cols);
+        opencl->readBuffer(buffer, rows * cols * sizeof(double), flat.data());
+        data.resize(rows);
+        for (int i = 0; i < rows; i++) {
+            data[i].resize(cols);
+            for (int j = 0; j < cols; j++) {
+                data[i][j] = flat[i * cols + j];
+            }
+        }
+    }
+
+    cl_mem getHandle() const { return buffer; }
+    int getRows() const { return rows; }
+    int getCols() const { return cols; }
+    bool isValid() const { return buffer != nullptr; }
+};
+
+// ============================================================================
+// RNN Cell Wrappers
+// ============================================================================
+
+static std::random_device rd;
+static std::mt19937 gen(rd());
+static std::uniform_real_distribution<> dis(0.0, 1.0);
+
+double ClipValue(double V, double MaxVal) {
+    if (V > MaxVal) return MaxVal;
+    if (V < -MaxVal) return -MaxVal;
+    return V;
+}
+
+double RandomWeight(double Scale) {
+    return (dis(gen) - 0.5) * 2.0 * Scale;
+}
+
+void InitMatrix(DArray2D& M, int Rows, int Cols, double Scale) {
+    M.resize(Rows);
+    for (int i = 0; i < Rows; i++) {
+        M[i].resize(Cols);
+        for (int j = 0; j < Cols; j++) {
+            M[i][j] = RandomWeight(Scale);
+        }
+    }
+}
+
+void ZeroMatrix(DArray2D& M, int Rows, int Cols) {
+    M.resize(Rows);
+    for (int i = 0; i < Rows; i++) {
+        M[i].resize(Cols, 0.0);
+    }
+}
+
+void ZeroArray(DArray& A, int Size) {
+    A.resize(Size, 0.0);
+}
+
+DArray ConcatArrays(const DArray& A, const DArray& B) {
+    DArray Result(A.size() + B.size());
+    std::copy(A.begin(), A.end(), Result.begin());
+    std::copy(B.begin(), B.end(), Result.begin() + A.size());
+    return Result;
+}
+
+double ApplyActivation(double X, TActivationType ActType) {
+    switch (ActType) {
+        case TActivationType::atSigmoid:
+            X = std::max(-500.0, std::min(500.0, X));
+            return 1.0 / (1.0 + std::exp(-X));
+        case TActivationType::atTanh:
+            return std::tanh(X);
+        case TActivationType::atReLU:
+            return X > 0 ? X : 0;
+        case TActivationType::atLinear:
+            return X;
+        default:
+            return X;
+    }
+}
+
+double ActivationDerivative(double Y, TActivationType ActType) {
+    switch (ActType) {
+        case TActivationType::atSigmoid:
+            return Y * (1.0 - Y);
+        case TActivationType::atTanh:
+            return 1.0 - Y * Y;
+        case TActivationType::atReLU:
+            return Y > 0 ? 1.0 : 0.0;
+        case TActivationType::atLinear:
+            return 1.0;
+        default:
+            return 1.0;
+    }
+}
+
+class TSimpleRNNCellWrapper {
+public:
+    int FInputSize, FHiddenSize;
+    TActivationType FActivation;
+    DArray2D Wih, Whh;
+    DArray Bh;
+    DArray2D dWih, dWhh;
+    DArray dBh;
+    DArray2D MWih, MWhh;
+    DArray MBh;
+    DArray2D VWih, VWhh;
+    DArray VBh;
+
+    TSimpleRNNCellWrapper(int InputSize, int HiddenSize, TActivationType Activation)
+        : FInputSize(InputSize), FHiddenSize(HiddenSize), FActivation(Activation) {
+        double Scale = std::sqrt(2.0 / (InputSize + HiddenSize));
+        InitMatrix(Wih, HiddenSize, InputSize, Scale);
+        InitMatrix(Whh, HiddenSize, HiddenSize, Scale);
+        ZeroArray(Bh, HiddenSize);
+        ZeroMatrix(dWih, HiddenSize, InputSize);
+        ZeroMatrix(dWhh, HiddenSize, HiddenSize);
+        ZeroArray(dBh, HiddenSize);
+        ZeroMatrix(MWih, HiddenSize, InputSize);
+        ZeroMatrix(MWhh, HiddenSize, HiddenSize);
+        ZeroArray(MBh, HiddenSize);
+        ZeroMatrix(VWih, HiddenSize, InputSize);
+        ZeroMatrix(VWhh, HiddenSize, HiddenSize);
+        ZeroArray(VBh, HiddenSize);
+    }
+
+    void Forward(const DArray& Input, const DArray& PrevH, DArray& H, DArray& PreH) {
+        H.resize(FHiddenSize);
+        PreH.resize(FHiddenSize);
+        for (int i = 0; i < FHiddenSize; i++) {
+            double Sum = Bh[i];
+            for (int j = 0; j < FInputSize; j++)
+                Sum += Wih[i][j] * Input[j];
+            for (int j = 0; j < FHiddenSize; j++)
+                Sum += Whh[i][j] * PrevH[j];
+            PreH[i] = Sum;
+            H[i] = ApplyActivation(Sum, FActivation);
+        }
+    }
+
+    void Backward(const DArray& dH, const DArray& H, const DArray& PreH,
+                  const DArray& PrevH, const DArray& Input, double ClipVal,
+                  DArray& dInput, DArray& dPrevH) {
+        DArray dHRaw(FHiddenSize);
+        dInput.resize(FInputSize, 0.0);
+        dPrevH.resize(FHiddenSize, 0.0);
+
+        for (int i = 0; i < FHiddenSize; i++)
+            dHRaw[i] = ClipValue(dH[i] * ActivationDerivative(H[i], FActivation), ClipVal);
+
+        for (int i = 0; i < FHiddenSize; i++) {
+            for (int j = 0; j < FInputSize; j++) {
+                dWih[i][j] += dHRaw[i] * Input[j];
+                dInput[j] += Wih[i][j] * dHRaw[i];
+            }
+            for (int j = 0; j < FHiddenSize; j++) {
+                dWhh[i][j] += dHRaw[i] * PrevH[j];
+                dPrevH[j] += Whh[i][j] * dHRaw[i];
+            }
+            dBh[i] += dHRaw[i];
+        }
+    }
+
+    void ApplyGradients(double LR, double ClipVal) {
+        for (int i = 0; i < FHiddenSize; i++) {
+            for (int j = 0; j < FInputSize; j++) {
+                Wih[i][j] -= LR * ClipValue(dWih[i][j], ClipVal);
+                dWih[i][j] = 0;
+            }
+            for (int j = 0; j < FHiddenSize; j++) {
+                Whh[i][j] -= LR * ClipValue(dWhh[i][j], ClipVal);
+                dWhh[i][j] = 0;
+            }
+            Bh[i] -= LR * ClipValue(dBh[i], ClipVal);
+            dBh[i] = 0;
+        }
+    }
+
+    void ResetGradients() {
+        ZeroMatrix(dWih, FHiddenSize, FInputSize);
+        ZeroMatrix(dWhh, FHiddenSize, FHiddenSize);
+        ZeroArray(dBh, FHiddenSize);
+    }
+};
+
+class TLSTMCellWrapper {
+public:
+    int FInputSize, FHiddenSize;
+    TActivationType FActivation;
     DArray2D Wf, Wi, Wc, Wo;
     DArray Bf, Bi, Bc, Bo;
     DArray2D dWf, dWi, dWc, dWo;
     DArray dBf, dBi, dBc, dBo;
 
-    // Device buffers (all weights, temporaries, intermediates)
-    std::unique_ptr<CLArray> g_Wf, g_Wi, g_Wc, g_Wo;
-    std::unique_ptr<CLArray> g_Bf, g_Bi, g_Bc, g_Bo;
-    std::unique_ptr<CLArray> g_SumF, g_SumI, g_SumC, g_SumO;
-    std::unique_ptr<CLArray> g_H, g_C, g_FG, g_IG, g_CTilde, g_OG, g_TanhC;
-    std::unique_ptr<CLArray> g_Concat, g_PrevH, g_PrevC;
-    // Optionally: gradients
+    TLSTMCellWrapper(int InputSize, int HiddenSize, TActivationType Activation)
+        : FInputSize(InputSize), FHiddenSize(HiddenSize), FActivation(Activation) {
+        double Scale = std::sqrt(2.0 / (InputSize + HiddenSize));
+        InitMatrix(Wf, HiddenSize, InputSize + HiddenSize, Scale);
+        InitMatrix(Wi, HiddenSize, InputSize + HiddenSize, Scale);
+        InitMatrix(Wc, HiddenSize, InputSize + HiddenSize, Scale);
+        InitMatrix(Wo, HiddenSize, InputSize + HiddenSize, Scale);
+        ZeroArray(Bf, HiddenSize);
+        ZeroArray(Bi, HiddenSize);
+        ZeroArray(Bc, HiddenSize);
+        ZeroArray(Bo, HiddenSize);
+        ZeroMatrix(dWf, HiddenSize, InputSize + HiddenSize);
+        ZeroMatrix(dWi, HiddenSize, InputSize + HiddenSize);
+        ZeroMatrix(dWc, HiddenSize, InputSize + HiddenSize);
+        ZeroMatrix(dWo, HiddenSize, InputSize + HiddenSize);
+        ZeroArray(dBf, HiddenSize);
+        ZeroArray(dBi, HiddenSize);
+        ZeroArray(dBc, HiddenSize);
+        ZeroArray(dBo, HiddenSize);
+    }
 
-    LSTMCell(int inputSize_, int hiddenSize_, ActivationType activation_,
-             cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel)
-        : inputSize(inputSize_), hiddenSize(hiddenSize_), activation(activation_),
-          context(ctx), queue(q) {
+    void Forward(const DArray& Input, const DArray& PrevH, const DArray& PrevC,
+                 DArray& H, DArray& C, DArray& FG, DArray& IG, DArray& CTilde, 
+                 DArray& OG, DArray& TanhC) {
+        DArray X = ConcatArrays(Input, PrevH);
+        H.resize(FHiddenSize);
+        C.resize(FHiddenSize);
+        FG.resize(FHiddenSize);
+        IG.resize(FHiddenSize);
+        CTilde.resize(FHiddenSize);
+        OG.resize(FHiddenSize);
+        TanhC.resize(FHiddenSize);
 
-        concatSize = inputSize + hiddenSize;
-        float scale = sqrt(2.0 / concatSize);
-
-        auto initMat = [&](DArray2D& M, int rows, int cols, float sc) {
-            std::uniform_real_distribution<> dis(-sc, sc);
-            M.resize(rows);
-            for (int i=0; i < rows; ++i) {
-                M[i].resize(cols);
-                for (int j=0; j < cols; ++j)
-                    M[i][j] = dis(gen);
+        for (int i = 0; i < FHiddenSize; i++) {
+            double Sf = Bf[i], Si = Bi[i], Sc = Bc[i], So = Bo[i];
+            for (int j = 0; j < (int)X.size(); j++) {
+                Sf += Wf[i][j] * X[j];
+                Si += Wi[i][j] * X[j];
+                Sc += Wc[i][j] * X[j];
+                So += Wo[i][j] * X[j];
             }
-        };
-        auto zeroMat = [](DArray2D& M, int rows, int cols) {
-            M.resize(rows); for (int i=0; i < rows; ++i) M[i].assign(cols, 0.0);
-        };
-        auto zeroArr = [](DArray& A, int sz, float val=0) { A.assign(sz, val); };
-
-        initMat(Wf, hiddenSize, concatSize, scale);
-        initMat(Wi, hiddenSize, concatSize, scale);
-        initMat(Wc, hiddenSize, concatSize, scale);
-        initMat(Wo, hiddenSize, concatSize, scale);
-        zeroArr(Bf, hiddenSize, 1.0); // LSTM forget bias initialized to 1.0
-        zeroArr(Bi, hiddenSize, 0.0);
-        zeroArr(Bc, hiddenSize, 0.0);
-        zeroArr(Bo, hiddenSize, 0.0);
-
-        // Gradients
-        zeroMat(dWf, hiddenSize, concatSize);
-        zeroMat(dWi, hiddenSize, concatSize);
-        zeroMat(dWc, hiddenSize, concatSize);
-        zeroMat(dWo, hiddenSize, concatSize);
-        zeroArr(dBf, hiddenSize);
-        zeroArr(dBi, hiddenSize);
-        zeroArr(dBc, hiddenSize);
-        zeroArr(dBo, hiddenSize);
-
-        // Flatten helpers
-        auto flatten = [](const DArray2D& M, int rows, int cols) {
-            std::vector<float> v(rows * cols);
-            for (int i=0, idx=0; i < rows; ++i)
-                for (int j=0; j < cols; ++j)
-                    v[idx++] = M[i][j];
-            return v;
-        };
-
-        g_Wf = std::make_unique<CLArray>(context, queue); g_Wf->allocate(hiddenSize*concatSize); g_Wf->copyToDevice(flatten(Wf, hiddenSize, concatSize));
-        g_Wi = std::make_unique<CLArray>(context, queue); g_Wi->allocate(hiddenSize*concatSize); g_Wi->copyToDevice(flatten(Wi, hiddenSize, concatSize));
-        g_Wc = std::make_unique<CLArray>(context, queue); g_Wc->allocate(hiddenSize*concatSize); g_Wc->copyToDevice(flatten(Wc, hiddenSize, concatSize));
-        g_Wo = std::make_unique<CLArray>(context, queue); g_Wo->allocate(hiddenSize*concatSize); g_Wo->copyToDevice(flatten(Wo, hiddenSize, concatSize));
-
-        g_Bf = std::make_unique<CLArray>(context, queue); g_Bf->allocate(hiddenSize); g_Bf->copyToDevice(Bf);
-        g_Bi = std::make_unique<CLArray>(context, queue); g_Bi->allocate(hiddenSize); g_Bi->copyToDevice(Bi);
-        g_Bc = std::make_unique<CLArray>(context, queue); g_Bc->allocate(hiddenSize); g_Bc->copyToDevice(Bc);
-        g_Bo = std::make_unique<CLArray>(context, queue); g_Bo->allocate(hiddenSize); g_Bo->copyToDevice(Bo);
-
-        // Temporaries (1 per sequence/batch, here 1)
-        g_SumF  = std::make_unique<CLArray>(context, queue); g_SumF->allocate(hiddenSize);
-        g_SumI  = std::make_unique<CLArray>(context, queue); g_SumI->allocate(hiddenSize);
-        g_SumC  = std::make_unique<CLArray>(context, queue); g_SumC->allocate(hiddenSize);
-        g_SumO  = std::make_unique<CLArray>(context, queue); g_SumO->allocate(hiddenSize);
-        g_H     = std::make_unique<CLArray>(context, queue); g_H->allocate(hiddenSize);
-        g_C     = std::make_unique<CLArray>(context, queue); g_C->allocate(hiddenSize);
-        g_FG    = std::make_unique<CLArray>(context, queue); g_FG->allocate(hiddenSize);
-        g_IG    = std::make_unique<CLArray>(context, queue); g_IG->allocate(hiddenSize);
-        g_CTilde= std::make_unique<CLArray>(context, queue); g_CTilde->allocate(hiddenSize);
-        g_OG    = std::make_unique<CLArray>(context, queue); g_OG->allocate(hiddenSize);
-        g_TanhC = std::make_unique<CLArray>(context, queue); g_TanhC->allocate(hiddenSize);
-
-        g_Concat = std::make_unique<CLArray>(context, queue); g_Concat->allocate(concatSize);
-        g_PrevH  = std::make_unique<CLArray>(context, queue); g_PrevH->allocate(hiddenSize);
-        g_PrevC  = std::make_unique<CLArray>(context, queue); g_PrevC->allocate(hiddenSize);
+            FG[i] = ApplyActivation(Sf, TActivationType::atSigmoid);
+            IG[i] = ApplyActivation(Si, TActivationType::atSigmoid);
+            CTilde[i] = ApplyActivation(Sc, FActivation);
+            C[i] = FG[i] * PrevC[i] + IG[i] * CTilde[i];
+            TanhC[i] = std::tanh(C[i]);
+            OG[i] = ApplyActivation(So, TActivationType::atSigmoid);
+            H[i] = OG[i] * TanhC[i];
+        }
     }
 
-    // LSTMCell forward (OpenCL)
-    void ForwardOpenCL(const DArray& input, const DArray& prevH, const DArray& prevC,
-                       DArray& H, DArray& C,
-                       DArray& FG, DArray& IG, DArray& CTilde, DArray& OG, DArray& TanhC,
-                       cl_kernel k_concat, cl_kernel k_lstm_forward) {
+    void Backward(const DArray& dH, DArray& dPrevC, const DArray& H, const DArray& C,
+                  const DArray& FG, const DArray& IG, const DArray& CTilde, const DArray& OG, 
+                  const DArray& TanhC, const DArray& PrevH, const DArray& PrevC, 
+                  const DArray& Input, double ClipVal, DArray& dInput, DArray& dPrevH, DArray& dPrevC_out) {
+        DArray dC(FHiddenSize, 0.0);
+        dInput.resize(Input.size(), 0.0);
+        dPrevH.resize(PrevH.size(), 0.0);
+        dPrevC_out.resize(PrevC.size(), 0.0);
+        DArray X = ConcatArrays(Input, PrevH);
 
-        // 1. Concat(input, prevH) → g_Concat
-        g_Concat->allocate(concatSize);
-        std::vector<float> concat(concatSize);
-        for(int i=0;i<inputSize;++i) concat[i]=input[i];
-        for(int i=0;i<hiddenSize;++i) concat[inputSize+i]=prevH[i];
-        g_Concat->copyToDevice(concat);
+        for (int i = 0; i < FHiddenSize; i++) {
+            double dO = dH[i] * TanhC[i] * OG[i] * (1.0 - OG[i]);
+            dC[i] += dH[i] * OG[i] * (1.0 - TanhC[i] * TanhC[i]);
+            dC[i] += dO;
 
-        // 2. Upload previous cell state
-        g_PrevC->copyToDevice(prevC);
+            double dF = dC[i] * PrevC[i] * FG[i] * (1.0 - FG[i]);
+            double dI = dC[i] * CTilde[i] * IG[i] * (1.0 - IG[i]);
+            double dCTilde = dC[i] * IG[i] * (1.0 - CTilde[i] * CTilde[i]);
 
-        // 3. Enqueue LSTM forward kernel
-        int idx = 0;
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_H->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_C->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_FG->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_IG->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_CTilde->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_OG->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_TanhC->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Wf->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Wi->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Wc->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Wo->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Bf->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Bi->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Bc->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Bo->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_Concat->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(cl_mem), &g_PrevC->d_ptr);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(int), &concatSize);
-        clSetKernelArg(k_lstm_forward, idx++, sizeof(int), &hiddenSize);
+            for (int j = 0; j < (int)X.size(); j++) {
+                dWf[i][j] += dF * X[j];
+                dWi[i][j] += dI * X[j];
+                dWc[i][j] += dCTilde * X[j];
+                dWo[i][j] += dO * X[j];
+            }
+            dBf[i] += dF;
+            dBi[i] += dI;
+            dBc[i] += dCTilde;
+            dBo[i] += dO;
+        }
 
-        size_t global = ((hiddenSize + BLOCK_SIZE - 1)/BLOCK_SIZE)*BLOCK_SIZE;
-        cl_int err = clEnqueueNDRangeKernel(queue, k_lstm_forward, 1, NULL, &global, NULL, 0, NULL, NULL);
-        CL_CHECK(err);
-        clFinish(queue);
-
-        // 4. Copy outputs to host
-        g_H->copyToHost(H);
-        g_C->copyToHost(C);
-        g_FG->copyToHost(FG);
-        g_IG->copyToHost(IG);
-        g_CTilde->copyToHost(CTilde);
-        g_OG->copyToHost(OG);
-        g_TanhC->copyToHost(TanhC);
+        for (int j = 0; j < (int)X.size(); j++) {
+            for (int i = 0; i < FHiddenSize; i++) {
+                double dx = Wf[i][j] * dC[i] + Wi[i][j] * dC[i] + Wc[i][j] * dC[i] + Wo[i][j] * dC[i];
+                if (j < (int)Input.size()) dInput[j] += dx;
+                else dPrevH[j - Input.size()] += dx;
+            }
+        }
+        for (int i = 0; i < FHiddenSize; i++) {
+            dPrevC_out[i] = dC[i] * FG[i];
+        }
     }
 
-    int GetHiddenSize() const { return hiddenSize; }
+    void ApplyGradients(double LR, double ClipVal) {
+        for (int i = 0; i < FHiddenSize; i++) {
+            for (int j = 0; j < (int)Wf[i].size(); j++) {
+                Wf[i][j] -= LR * ClipValue(dWf[i][j], ClipVal);
+                Wi[i][j] -= LR * ClipValue(dWi[i][j], ClipVal);
+                Wc[i][j] -= LR * ClipValue(dWc[i][j], ClipVal);
+                Wo[i][j] -= LR * ClipValue(dWo[i][j], ClipVal);
+            }
+            Bf[i] -= LR * ClipValue(dBf[i], ClipVal);
+            Bi[i] -= LR * ClipValue(dBi[i], ClipVal);
+            Bc[i] -= LR * ClipValue(dBc[i], ClipVal);
+            Bo[i] -= LR * ClipValue(dBo[i], ClipVal);
+        }
+        ResetGradients();
+    }
 
-    // Add similar logic for backward/gradient/apply ops as needed.
+    void ResetGradients() {
+        ZeroMatrix(dWf, FHiddenSize, FInputSize);
+        ZeroMatrix(dWi, FHiddenSize, FInputSize);
+        ZeroMatrix(dWc, FHiddenSize, FInputSize);
+        ZeroMatrix(dWo, FHiddenSize, FInputSize);
+        ZeroArray(dBf, FHiddenSize);
+        ZeroArray(dBi, FHiddenSize);
+        ZeroArray(dBc, FHiddenSize);
+        ZeroArray(dBo, FHiddenSize);
+    }
 };
 
-
-class GRUCell {
+class TGRUCellWrapper {
 public:
-    int inputSize, hiddenSize, concatSize;
-    ActivationType activation;
-    cl_context context;
-    cl_command_queue queue;
-
-    // Host-side weights & grads
+    int FInputSize, FHiddenSize;
+    TActivationType FActivation;
     DArray2D Wz, Wr, Wh;
     DArray Bz, Br, Bh;
     DArray2D dWz, dWr, dWh;
     DArray dBz, dBr, dBh;
 
-    // Device buffers
-    std::unique_ptr<CLArray> g_Wz, g_Wr, g_Wh;
-    std::unique_ptr<CLArray> g_Bz, g_Br, g_Bh;
-    std::unique_ptr<CLArray> g_H, g_Z, g_R, g_HTilde;
-    std::unique_ptr<CLArray> g_Concat, g_Input, g_PrevH;
+    TGRUCellWrapper(int InputSize, int HiddenSize, TActivationType Activation)
+        : FInputSize(InputSize), FHiddenSize(HiddenSize), FActivation(Activation) {
+        double Scale = std::sqrt(2.0 / (InputSize + HiddenSize));
+        InitMatrix(Wz, HiddenSize, InputSize + HiddenSize, Scale);
+        InitMatrix(Wr, HiddenSize, InputSize + HiddenSize, Scale);
+        InitMatrix(Wh, HiddenSize, InputSize + HiddenSize, Scale);
+        ZeroArray(Bz, HiddenSize);
+        ZeroArray(Br, HiddenSize);
+        ZeroArray(Bh, HiddenSize);
+        ZeroMatrix(dWz, HiddenSize, InputSize + HiddenSize);
+        ZeroMatrix(dWr, HiddenSize, InputSize + HiddenSize);
+        ZeroMatrix(dWh, HiddenSize, InputSize + HiddenSize);
+        ZeroArray(dBz, HiddenSize);
+        ZeroArray(dBr, HiddenSize);
+        ZeroArray(dBh, HiddenSize);
+    }
 
-    GRUCell(int inputSize_, int hiddenSize_, ActivationType activation_,
-            cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel)
-        : inputSize(inputSize_), hiddenSize(hiddenSize_), activation(activation_),
-          context(ctx), queue(q)
-    {
-        concatSize = inputSize + hiddenSize;
-        float scale = sqrt(2.0 / concatSize);
-        // Random/init helpers
-        auto initMat = [&](DArray2D& M, int rows, int cols, float sc){
-            std::uniform_real_distribution<> dis(-sc, sc);
-            M.resize(rows); for (int i=0; i<rows; ++i) {
-                M[i].resize(cols); for(int j=0;j<cols;++j) M[i][j]=dis(gen);
+    void Forward(const DArray& Input, const DArray& PrevH, DArray& H, DArray& Z, DArray& R, DArray& HTilde) {
+        DArray X = ConcatArrays(Input, PrevH);
+        H.resize(FHiddenSize);
+        Z.resize(FHiddenSize);
+        R.resize(FHiddenSize);
+        HTilde.resize(FHiddenSize);
+
+        for (int i = 0; i < FHiddenSize; i++) {
+            double Sz = Bz[i], Sr = Br[i];
+            for (int j = 0; j < (int)X.size(); j++) {
+                Sz += Wz[i][j] * X[j];
+                Sr += Wr[i][j] * X[j];
             }
-        };
-        auto zeroMat = [](DArray2D& M, int rows, int cols) {
-            M.resize(rows); for(int i=0;i<rows;++i) M[i].assign(cols,0.0);
-        };
-        auto zeroArr = [](DArray& A, int sz, float v=0.0) { A.assign(sz,v); };
+            Z[i] = ApplyActivation(Sz, TActivationType::atSigmoid);
+            R[i] = ApplyActivation(Sr, TActivationType::atSigmoid);
+        }
 
-        initMat(Wz, hiddenSize, concatSize, scale);
-        initMat(Wr, hiddenSize, concatSize, scale);
-        initMat(Wh, hiddenSize, concatSize, scale);
-        zeroArr(Bz, hiddenSize, 0.0);
-        zeroArr(Br, hiddenSize, 0.0);
-        zeroArr(Bh, hiddenSize, 0.0);
-
-        zeroMat(dWz, hiddenSize, concatSize);
-        zeroMat(dWr, hiddenSize, concatSize);
-        zeroMat(dWh, hiddenSize, concatSize);
-        zeroArr(dBz, hiddenSize);
-        zeroArr(dBr, hiddenSize);
-        zeroArr(dBh, hiddenSize);
-
-        auto flatten = [](const DArray2D& M, int rows, int cols) {
-            std::vector<float> v(rows*cols);
-            for (int i=0, idx=0; i<rows; ++i)
-                for(int j=0;j<cols;++j)
-                    v[idx++] = M[i][j];
-            return v;
-        };
-
-        g_Wz = std::make_unique<CLArray>(context, queue); g_Wz->allocate(hiddenSize*concatSize); g_Wz->copyToDevice(flatten(Wz,hiddenSize,concatSize));
-        g_Wr = std::make_unique<CLArray>(context, queue); g_Wr->allocate(hiddenSize*concatSize); g_Wr->copyToDevice(flatten(Wr,hiddenSize,concatSize));
-        g_Wh = std::make_unique<CLArray>(context, queue); g_Wh->allocate(hiddenSize*concatSize); g_Wh->copyToDevice(flatten(Wh,hiddenSize,concatSize));
-        g_Bz = std::make_unique<CLArray>(context, queue); g_Bz->allocate(hiddenSize); g_Bz->copyToDevice(Bz);
-        g_Br = std::make_unique<CLArray>(context, queue); g_Br->allocate(hiddenSize); g_Br->copyToDevice(Br);
-        g_Bh = std::make_unique<CLArray>(context, queue); g_Bh->allocate(hiddenSize); g_Bh->copyToDevice(Bh);
-
-        // Temporaries
-        g_H      = std::make_unique<CLArray>(context, queue); g_H->allocate(hiddenSize);
-        g_Z      = std::make_unique<CLArray>(context, queue); g_Z->allocate(hiddenSize);
-        g_R      = std::make_unique<CLArray>(context, queue); g_R->allocate(hiddenSize);
-        g_HTilde = std::make_unique<CLArray>(context, queue); g_HTilde->allocate(hiddenSize);
-        g_Concat = std::make_unique<CLArray>(context, queue); g_Concat->allocate(concatSize);
-        g_Input  = std::make_unique<CLArray>(context, queue); g_Input->allocate(inputSize);
-        g_PrevH  = std::make_unique<CLArray>(context, queue); g_PrevH->allocate(hiddenSize);
+        for (int i = 0; i < FHiddenSize; i++) {
+            double Sh = Bh[i];
+            for (int j = 0; j < (int)Input.size(); j++) {
+                Sh += Wh[i][j] * Input[j];
+            }
+            for (int j = 0; j < FHiddenSize; j++) {
+                Sh += Wh[i][Input.size() + j] * R[i] * PrevH[j];
+            }
+            HTilde[i] = ApplyActivation(Sh, FActivation);
+            H[i] = (1.0 - Z[i]) * HTilde[i] + Z[i] * PrevH[i];
+        }
     }
 
-    void ForwardOpenCL(const DArray& input, const DArray& prevH,
-                       DArray& H, DArray& Z, DArray& R, DArray& HTilde,
-                       cl_kernel k_concat, cl_kernel k_gates, cl_kernel k_hidden) {
-        // Upload input and prevH & form concat host-side (no need for concat kernel here)
-        std::vector<float> concat(concatSize);
-        for(int i=0;i<inputSize;++i) concat[i]=input[i];
-        for(int i=0;i<hiddenSize;++i) concat[inputSize+i]=prevH[i];
-        g_Concat->copyToDevice(concat);
-        g_Input->copyToDevice(input);
-        g_PrevH->copyToDevice(prevH);
+    void Backward(const DArray& dH, const DArray& H, const DArray& Z, const DArray& R, 
+                  const DArray& HTilde, const DArray& PrevH, const DArray& Input, 
+                  double ClipVal, DArray& dInput, DArray& dPrevH) {
+        dInput.resize(Input.size(), 0.0);
+        dPrevH.resize(PrevH.size(), 0.0);
 
-        // 1. Z/R gates
-        int idx=0;
-        clSetKernelArg(k_gates, idx++, sizeof(cl_mem), &g_Z->d_ptr);
-        clSetKernelArg(k_gates, idx++, sizeof(cl_mem), &g_R->d_ptr);
-        clSetKernelArg(k_gates, idx++, sizeof(cl_mem), &g_Wz->d_ptr);
-        clSetKernelArg(k_gates, idx++, sizeof(cl_mem), &g_Wr->d_ptr);
-        clSetKernelArg(k_gates, idx++, sizeof(cl_mem), &g_Bz->d_ptr);
-        clSetKernelArg(k_gates, idx++, sizeof(cl_mem), &g_Br->d_ptr);
-        clSetKernelArg(k_gates, idx++, sizeof(cl_mem), &g_Concat->d_ptr);
-        clSetKernelArg(k_gates, idx++, sizeof(int), &concatSize);
-        clSetKernelArg(k_gates, idx++, sizeof(int), &hiddenSize);
+        for (int i = 0; i < FHiddenSize; i++) {
+            double dZ = dH[i] * (PrevH[i] - HTilde[i]) * Z[i] * (1.0 - Z[i]);
+            double dHTilde = dH[i] * (1.0 - Z[i]) * ActivationDerivative(HTilde[i], FActivation);
 
-        size_t global = ((hiddenSize + BLOCK_SIZE - 1)/BLOCK_SIZE) * BLOCK_SIZE;
-        cl_int err = clEnqueueNDRangeKernel(queue, k_gates, 1, NULL, &global, NULL, 0, NULL, NULL);
-        CL_CHECK(err);
-        clFinish(queue);
+            for (int j = 0; j < (int)Input.size(); j++) {
+                dWz[i][j] += dZ * Input[j];
+                dWh[i][j] += dHTilde * Input[j];
+            }
+            dBz[i] += dZ;
+            dBh[i] += dHTilde;
+        }
 
-        // 2. Compute h̃ and H
-        idx = 0;
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_H->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_HTilde->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_Wh->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_Bh->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_Input->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_PrevH->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_Z->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(cl_mem), &g_R->d_ptr);
-        clSetKernelArg(k_hidden, idx++, sizeof(int), &inputSize);
-        clSetKernelArg(k_hidden, idx++, sizeof(int), &hiddenSize);
-
-        err = clEnqueueNDRangeKernel(queue, k_hidden, 1, NULL, &global, NULL, 0, NULL, NULL);
-        CL_CHECK(err);
-        clFinish(queue);
-
-        // Download results
-        g_H->copyToHost(H);
-        g_Z->copyToHost(Z);
-        g_R->copyToHost(R);
-        g_HTilde->copyToHost(HTilde);
+        for (int i = 0; i < FHiddenSize; i++) {
+            dPrevH[i] += dH[i] * Z[i];
+        }
     }
 
-    int GetHiddenSize() const { return hiddenSize; }
-    // For backward, grads, parameter update, adapt from CUDA/previous notes.
+    void ApplyGradients(double LR, double ClipVal) {
+        for (int i = 0; i < FHiddenSize; i++) {
+            for (int j = 0; j < (int)Wz[i].size(); j++) {
+                Wz[i][j] -= LR * ClipValue(dWz[i][j], ClipVal);
+                Wr[i][j] -= LR * ClipValue(dWr[i][j], ClipVal);
+                Wh[i][j] -= LR * ClipValue(dWh[i][j], ClipVal);
+            }
+            Bz[i] -= LR * ClipValue(dBz[i], ClipVal);
+            Br[i] -= LR * ClipValue(dBr[i], ClipVal);
+            Bh[i] -= LR * ClipValue(dBh[i], ClipVal);
+        }
+        ResetGradients();
+    }
+
+    void ResetGradients() {
+        ZeroMatrix(dWz, FHiddenSize, FInputSize);
+        ZeroMatrix(dWr, FHiddenSize, FInputSize);
+        ZeroMatrix(dWh, FHiddenSize, FInputSize);
+        ZeroArray(dBz, FHiddenSize);
+        ZeroArray(dBr, FHiddenSize);
+        ZeroArray(dBh, FHiddenSize);
+    }
 };
 
-class OutputLayer {
+class TOutputLayerWrapper {
 public:
-    int inputSize, outputSize;
-    ActivationType activation;
-    cl_context context;
-    cl_command_queue queue;
-
-    DArray2D W; // [outputSize][inputSize]
-    DArray B;   // [outputSize]
+    int FInputSize, FOutputSize;
+    TActivationType FActivation;
+    DArray2D W;
+    DArray B;
     DArray2D dW;
     DArray dB;
+    DArray2D MW;
+    DArray MB;
+    DArray2D VW;
+    DArray VB;
 
-    // Device side
-    std::unique_ptr<CLArray> g_W, g_B, g_dW, g_dB;
-    std::unique_ptr<CLArray> g_Pre, g_Out, g_Input;
+    TOutputLayerWrapper(int InputSize, int OutputSize, TActivationType Activation)
+        : FInputSize(InputSize), FOutputSize(OutputSize), FActivation(Activation) {
+        double Scale = std::sqrt(2.0 / InputSize);
+        InitMatrix(W, OutputSize, InputSize, Scale);
+        ZeroArray(B, OutputSize);
+        ZeroMatrix(dW, OutputSize, InputSize);
+        ZeroArray(dB, OutputSize);
+        ZeroMatrix(MW, OutputSize, InputSize);
+        ZeroArray(MB, OutputSize);
+        ZeroMatrix(VW, OutputSize, InputSize);
+        ZeroArray(VB, OutputSize);
+    }
 
-    OutputLayer(int inputSize_, int outputSize_, ActivationType activation_,
-                cl_context ctx, cl_command_queue q, cl_kernel k_zero_kernel)
-        : inputSize(inputSize_), outputSize(outputSize_), activation(activation_),
-          context(ctx), queue(q)
-    {
-        float scale = sqrt(2.0 / inputSize);
-        std::uniform_real_distribution<> dis(-scale, scale);
-
-        W.resize(outputSize);
-        for (int i = 0; i < outputSize; ++i) {
-            W[i].resize(inputSize);
-            for (int j = 0; j < inputSize; ++j)
-                W[i][j] = dis(gen);
+    void Forward(const DArray& Input, DArray& Output, DArray& Pre) {
+        Output.resize(FOutputSize);
+        Pre.resize(FOutputSize);
+        for (int i = 0; i < FOutputSize; i++) {
+            double Sum = B[i];
+            for (int j = 0; j < FInputSize; j++)
+                Sum += W[i][j] * Input[j];
+            Pre[i] = Sum;
+            Output[i] = ApplyActivation(Sum, FActivation);
         }
-        B.assign(outputSize, 0.0);
-
-        dW.resize(outputSize);
-        for (int i = 0; i < outputSize; ++i)
-            dW[i].assign(inputSize, 0.0);
-        dB.assign(outputSize, 0.0);
-
-        // Flatten helpers
-        auto flatten = [](const DArray2D& M, int rows, int cols) {
-            std::vector<float> v(rows * cols);
-            for (int i=0, idx=0;i<rows;++i)
-                for (int j=0;j<cols;++j)
-                    v[idx++] = M[i][j];
-            return v;
-        };
-
-        g_W  = std::make_unique<CLArray>(context, queue); g_W->allocate(outputSize*inputSize); g_W->copyToDevice(flatten(W,outputSize,inputSize));
-        g_B  = std::make_unique<CLArray>(context, queue); g_B->allocate(outputSize); g_B->copyToDevice(B);
-        g_dW = std::make_unique<CLArray>(context, queue); g_dW->allocate(outputSize*inputSize); g_dW->zero(k_zero_kernel);
-        g_dB = std::make_unique<CLArray>(context, queue); g_dB->allocate(outputSize); g_dB->zero(k_zero_kernel);
-
-        g_Pre   = std::make_unique<CLArray>(context, queue); g_Pre->allocate(outputSize);
-        g_Out   = std::make_unique<CLArray>(context, queue); g_Out->allocate(outputSize);
-        g_Input = std::make_unique<CLArray>(context, queue); g_Input->allocate(inputSize);
     }
 
-    void ForwardOpenCL(const DArray& input, DArray& output, DArray& pre,
-                       cl_kernel k_output_forward) {
-        g_Input->copyToDevice(input);
-
-        int idx = 0;
-        clSetKernelArg(k_output_forward, idx++, sizeof(cl_mem), &g_Out->d_ptr);
-        clSetKernelArg(k_output_forward, idx++, sizeof(cl_mem), &g_Pre->d_ptr);
-        clSetKernelArg(k_output_forward, idx++, sizeof(cl_mem), &g_W->d_ptr);
-        clSetKernelArg(k_output_forward, idx++, sizeof(cl_mem), &g_B->d_ptr);
-        clSetKernelArg(k_output_forward, idx++, sizeof(cl_mem), &g_Input->d_ptr);
-        clSetKernelArg(k_output_forward, idx++, sizeof(int), &inputSize);
-        clSetKernelArg(k_output_forward, idx++, sizeof(int), &outputSize);
-        int actT = activation;
-        clSetKernelArg(k_output_forward, idx++, sizeof(int), &actT);
-        size_t global = ((outputSize + BLOCK_SIZE - 1)/BLOCK_SIZE)*BLOCK_SIZE;
-
-        cl_int err = clEnqueueNDRangeKernel(queue, k_output_forward, 1, NULL, &global, NULL, 0, NULL, NULL);
-        CL_CHECK(err);
-        clFinish(queue);
-
-        g_Out->copyToHost(output);
-        g_Pre->copyToHost(pre);
-    }
-
-    int GetOutputSize() const { return outputSize; }
-
-    // Backward/gradient logic as relevant; parameter update similar to cell classes.
-};
-
-class RNNModelOpenCL {
-public:
-    int inputSize, hiddenSize, outputSize;
-    ActivationType hiddenActivation, outputActivation;
-    LossType lossType;
-    CellType cellType;
-    float learningRate;
-    float gradClipValue;
-    int bpttSteps;
-    cl_context context;
-    cl_command_queue queue;
-
-    std::unique_ptr<SimpleRNNCell> simpleCell;
-    std::unique_ptr<LSTMCell> lstmCell;
-    std::unique_ptr<GRUCell> gruCell;
-    std::unique_ptr<OutputLayer> outputLayer;
-
-    // OpenCL kernels (should be loaded and compiled at init!)
-    cl_kernel k_simple_rnn_forward;
-    cl_kernel k_lstm_forward;
-    cl_kernel k_gru_gates;
-    cl_kernel k_gru_hidden;
-    cl_kernel k_output_forward;
-    cl_kernel k_zero;
-    cl_kernel k_fill;
-    cl_kernel k_concat;
-
-    RNNModelOpenCL(int inputSize_, int hiddenSize_, int outputSize_,
-                   ActivationType hiddenAct_, ActivationType outputAct_,
-                   LossType lossType_, CellType cellType_, float lr, float clipVal,
-                   int bpttSteps_,
-                   cl_context ctx, cl_command_queue q,
-                   cl_kernel ker_simple_rnn_forward,
-                   cl_kernel ker_lstm_forward,
-                   cl_kernel ker_gru_gates,
-                   cl_kernel ker_gru_hidden,
-                   cl_kernel ker_output_forward,
-                   cl_kernel ker_concat,
-                   cl_kernel ker_zero,
-                   cl_kernel ker_fill)
-    : inputSize(inputSize_), hiddenSize(hiddenSize_), outputSize(outputSize_),
-    hiddenActivation(hiddenAct_), outputActivation(outputAct_),
-    lossType(lossType_), cellType(cellType_), learningRate(lr), gradClipValue(clipVal),
-    bpttSteps(bpttSteps_), context(ctx), queue(q),
-    k_simple_rnn_forward(ker_simple_rnn_forward),
-    k_lstm_forward(ker_lstm_forward),
-    k_gru_gates(ker_gru_gates),
-    k_gru_hidden(ker_gru_hidden),
-    k_output_forward(ker_output_forward),
-    k_concat(ker_concat),
-    k_zero(ker_zero),
-    k_fill(ker_fill)
-    {
-        // Create and wire up cells
-        if (cellType == ctSimpleRNN) {
-            simpleCell = std::make_unique<SimpleRNNCell>(inputSize, hiddenSize, hiddenActivation, context, queue, k_zero);
-        } else if (cellType == ctLSTM) {
-            lstmCell = std::make_unique<LSTMCell>(inputSize, hiddenSize, hiddenActivation, context, queue, k_zero);
-        } else if (cellType == ctGRU) {
-            gruCell = std::make_unique<GRUCell>(inputSize, hiddenSize, hiddenActivation, context, queue, k_zero);
-        }
-        outputLayer = std::make_unique<OutputLayer>(hiddenSize, outputSize, outputActivation, context, queue, k_zero);
-    }
-
-    // Forward pass for a sequence, float precision
-    void ForwardSequence(const std::vector<DArray>& inputs, std::vector<DArray>& outputs) {
-        outputs.clear();
-        DArray h(hiddenSize, 0.0), c(hiddenSize, 0.0), prevH(hiddenSize, 0.0), prevC(hiddenSize, 0.0);
-
-        for (size_t t = 0; t < inputs.size(); ++t) {
-            if (cellType == ctSimpleRNN) {
-                DArray preH;
-                simpleCell->ForwardOpenCL(inputs[t], h, h, preH, k_simple_rnn_forward);
-            } else if (cellType == ctLSTM) {
-                DArray fg, ig, ctilde, og, tanhc;
-                lstmCell->ForwardOpenCL(inputs[t], h, c, h, c, fg, ig, ctilde, og, tanhc, k_concat, k_lstm_forward);
-            } else if (cellType == ctGRU) {
-                DArray z, r, htilde;
-                gruCell->ForwardOpenCL(inputs[t], h, h, z, r, htilde, k_concat, k_gru_gates, k_gru_hidden);
+    void Backward(const DArray& dOut, const DArray& Output, const DArray& Pre,
+                  const DArray& Input, double ClipVal, DArray& dInput) {
+        dInput.resize(FInputSize, 0.0);
+        for (int i = 0; i < FOutputSize; i++) {
+            double dOut_i = ClipValue(dOut[i] * ActivationDerivative(Output[i], FActivation), ClipVal);
+            for (int j = 0; j < FInputSize; j++) {
+                dW[i][j] += dOut_i * Input[j];
+                dInput[j] += W[i][j] * dOut_i;
             }
-            DArray out, pre;
-            outputLayer->ForwardOpenCL(h, out, pre, k_output_forward);
-            outputs.push_back(out);
+            dB[i] += dOut_i;
         }
     }
 
-    int GetInputSize() const { return inputSize; }
-    int GetHiddenSize() const { return hiddenSize; }
-    int GetOutputSize() const { return outputSize; }
-    CellType GetCellType() const { return cellType; }
+    void ApplyGradients(double LR, double ClipVal) {
+        for (int i = 0; i < FOutputSize; i++) {
+            for (int j = 0; j < FInputSize; j++) {
+                W[i][j] -= LR * ClipValue(dW[i][j], ClipVal);
+                dW[i][j] = 0;
+            }
+            B[i] -= LR * ClipValue(dB[i], ClipVal);
+            dB[i] = 0;
+        }
+    }
 
-    // Backward, optimizer step, save/load omitted -- similar to CUDA/OpenCL implementation
+    void ResetGradients() {
+        ZeroMatrix(dW, FOutputSize, FInputSize);
+        ZeroArray(dB, FOutputSize);
+    }
 };
 
-void PrintUsage(const char* progname) {
-    cout << "RNN Facade CLI (OpenCL GPU/CPU) - Matthew Abbott 2025\n\n";
-    cout << "Usage: " << progname << " <command> [options]\n\n";
-    cout << "Commands:\n";
-    cout << "  create              Create and initialize an RNN model\n";
-    cout << "  train               Train the model on data\n";
-    cout << "  predict             Run prediction on input data\n";
-    cout << "  info                Display GPU/CPU device information\n";
-    cout << "\nFacade Introspection Commands:\n";
-    cout << "  get-hidden          Get hidden state value\n";
-    cout << "  set-hidden          Set hidden state value\n";
-    cout << "  get-output          Get output value at timestep\n";
-    cout << "  get-cell-state      Get LSTM cell state\n";
-    cout << "  get-gate            Get gate value (LSTM/GRU)\n";
-    cout << "  get-preactivation   Get pre-activation value\n";
-    cout << "  get-input           Get input vector value\n";
-    cout << "  reset-states        Reset all hidden/cell states\n";
-    cout << "  set-dropout         Set dropout rate\n";
-    cout << "  get-dropout         Get current dropout rate\n";
-    cout << "  detect-vanishing    Check for vanishing gradients\n";
-    cout << "  detect-exploding    Check for exploding gradients\n";
-    cout << "  get-seq-outputs     Get all outputs for a sequence\n";
-    cout << "  get-seq-hidden      Get hidden states over sequence\n";
-    cout << "\nCreate/Train/Predict options:\n";
-    cout << "  --input-size <n>       Input dimension (required)\n";
-    cout << "  --hidden-sizes <n,n>   Comma-separated hidden layer sizes (required)\n";
-    cout << "  --output-size <n>      Output dimension (required)\n";
-    cout << "  --cell-type <type>     rnn, lstm, or gru (default: lstm)\n";
-    cout << "  --activation <type>    sigmoid, tanh, relu, linear (default: tanh)\n";
-    cout << "  --output-activation    Output layer activation (default: sigmoid)\n";
-    cout << "  --loss <type>          mse or crossentropy (default: mse)\n";
-    cout << "  --learning-rate <f>    Learning rate (default: 0.01)\n";
-    cout << "  --gradient-clip <f>    Gradient clipping value (default: 5.0)\n";
-    cout << "  --bptt-steps <n>       BPTT truncation steps (default: 0 = full)\n";
-    cout << "  --epochs <n>           Number of training epochs (default: 100)\n";
-    cout << "  --input-file <file>    CSV file with input sequences\n";
-    cout << "  --target-file <file>   CSV file with target sequences\n";
-    cout << "  --output-file <file>   CSV file to write predictions\n";
-    cout << "\nFacade options:\n";
-    cout << "  --layer <n>            Layer index (default: 0)\n";
-    cout << "  --timestep <n>         Timestep index (default: 0)\n";
-    cout << "  --neuron <n>           Neuron index (default: 0)\n";
-    cout << "  --output-idx <n>       Output index (default: 0)\n";
-    cout << "  --value <f>            Value to set\n";
-    cout << "  --gate <type>          Gate type: forget,input,output,cell,update,reset,hidden\n";
-    cout << "  --threshold <f>        Threshold for gradient detection (default: 1e-6)\n";
+// ============================================================================
+// Main RNN Facade (CPU version for simplicity)
+// ============================================================================
+
+double ComputeLoss(const DArray& Pred, const DArray& Target, TLossType LossType) {
+    double Loss = 0.0;
+    if (LossType == TLossType::ltMSE) {
+        for (size_t i = 0; i < Pred.size(); i++) {
+            double Diff = Pred[i] - Target[i];
+            Loss += Diff * Diff;
+        }
+        Loss /= Pred.size();
+    } else if (LossType == TLossType::ltCrossEntropy) {
+        for (size_t i = 0; i < Pred.size(); i++) {
+            Loss -= Target[i] * std::log(std::max(Pred[i], 1e-10));
+        }
+    }
+    return Loss;
 }
 
-int main(int argc, char** argv) {
-    srand((unsigned)time(nullptr));
-    if (argc < 2 || std::string(argv[1]) == "help" || std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
-        PrintUsage(argv[0]);
+void ComputeLossGradient(const DArray& Pred, const DArray& Target, TLossType LossType, DArray& Grad) {
+    Grad.resize(Pred.size());
+    if (LossType == TLossType::ltMSE) {
+        for (size_t i = 0; i < Pred.size(); i++) {
+            Grad[i] = 2.0 * (Pred[i] - Target[i]) / Pred.size();
+        }
+    } else if (LossType == TLossType::ltCrossEntropy) {
+        for (size_t i = 0; i < Pred.size(); i++) {
+            Grad[i] = -Target[i] / std::max(Pred[i], 1e-10);
+        }
+    }
+}
+
+class TRNNFacadeOpenCL {
+private:
+    int FInputSize, FOutputSize;
+    std::vector<int> FHiddenSizes;
+    TCellType FCellType;
+    TActivationType FActivation;
+    TActivationType FOutputActivation;
+    TLossType FLossType;
+    double FLearningRate;
+    double FGradientClip;
+    int FBPTTSteps;
+    double FDropoutRate;
+    bool FUseDropout;
+
+    std::vector<TSimpleRNNCellWrapper> FSimpleCells;
+    std::vector<TLSTMCellWrapper> FLSTMCells;
+    std::vector<TGRUCellWrapper> FGRUCells;
+    TOutputLayerWrapper* FOutputLayer;
+
+    TTimeStepCacheExArray FCaches;
+    DArray3D FStates;
+    int FSequenceLen;
+    DArray2D FGradientHistory;
+
+    std::unique_ptr<OpenCLUtil> opencl;
+    cl_program kernel_program;
+    std::unordered_map<std::string, cl_kernel> kernels;
+
+    std::vector<std::unique_ptr<GPUMatrix>> gpu_Wih, gpu_Whh, gpu_Bh;
+    std::vector<std::unique_ptr<GPUMatrix>> gpu_Wf, gpu_Wi, gpu_Wc, gpu_Wo;
+    std::vector<std::unique_ptr<GPUMatrix>> gpu_dWih, gpu_dWhh;
+
+    std::unique_ptr<GPUBuffer> gpu_input, gpu_hidden, gpu_prev_h;
+    std::unique_ptr<GPUBuffer> gpu_dhidden, gpu_doutput;
+
+    bool use_gpu;
+
+public:
+    TRNNFacadeOpenCL(int InputSize, const std::vector<int>& HiddenSizes,
+                     int OutputSize, TCellType CellType,
+                     TActivationType Activation, TActivationType OutputActivation,
+                     TLossType LossType, double LearningRate, double GradientClip,
+                     int BPTTSteps, bool useGPU = true)
+        : FInputSize(InputSize), FOutputSize(OutputSize), FHiddenSizes(HiddenSizes),
+          FCellType(CellType), FActivation(Activation), FOutputActivation(OutputActivation),
+          FLossType(LossType), FLearningRate(LearningRate), FGradientClip(GradientClip),
+          FBPTTSteps(BPTTSteps), FDropoutRate(0.0), FUseDropout(false), FSequenceLen(0),
+          kernel_program(nullptr), use_gpu(useGPU) {
+
+        FOutputLayer = new TOutputLayerWrapper(HiddenSizes.back(), OutputSize, OutputActivation);
+
+        if (CellType == TCellType::ctSimpleRNN) {
+            for (size_t i = 0; i < HiddenSizes.size(); i++) {
+                int InSize = (i == 0) ? InputSize : HiddenSizes[i-1];
+                FSimpleCells.emplace_back(InSize, HiddenSizes[i], Activation);
+            }
+        } else if (CellType == TCellType::ctLSTM) {
+            for (size_t i = 0; i < HiddenSizes.size(); i++) {
+                int InSize = (i == 0) ? InputSize : HiddenSizes[i-1];
+                FLSTMCells.emplace_back(InSize, HiddenSizes[i], Activation);
+            }
+        } else if (CellType == TCellType::ctGRU) {
+            for (size_t i = 0; i < HiddenSizes.size(); i++) {
+                int InSize = (i == 0) ? InputSize : HiddenSizes[i-1];
+                FGRUCells.emplace_back(InSize, HiddenSizes[i], Activation);
+            }
+        }
+
+        FStates = InitHiddenStates();
+
+        if (useGPU) {
+            opencl = std::make_unique<OpenCLUtil>();
+            if (opencl->initialize(true)) {
+                std::cout << "OpenCL initialized successfully" << std::endl;
+            } else {
+                use_gpu = false;
+                std::cout << "OpenCL initialization failed, using CPU" << std::endl;
+            }
+        }
+    }
+
+    ~TRNNFacadeOpenCL() {
+        delete FOutputLayer;
+        for (auto& kv : kernels) {
+            if (kv.second) clReleaseKernel(kv.second);
+        }
+        kernels.clear();
+        if (kernel_program) clReleaseProgram(kernel_program);
+    }
+
+    DArray3D InitHiddenStates() {
+        DArray3D States(FHiddenSizes.size());
+        for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+            States[i].resize(2);
+            States[i][0].resize(FHiddenSizes[i], 0.0);
+            if (FCellType == TCellType::ctLSTM)
+                States[i][1].resize(FHiddenSizes[i], 0.0);
+        }
+        return States;
+    }
+
+    DArray2D ForwardSequence(const DArray2D& Inputs) {
+        FSequenceLen = Inputs.size();
+        FCaches.resize(FSequenceLen);
+        FGradientHistory.resize(FSequenceLen);
+
+        DArray2D Outputs(FSequenceLen);
+
+        for (int t = 0; t < FSequenceLen; t++) {
+            FCaches[t].Input = Inputs[t];
+
+            DArray LayerInput = Inputs[t];
+            std::vector<DArray> LayerOutputs(FHiddenSizes.size());
+
+            for (size_t layer = 0; layer < FHiddenSizes.size(); layer++) {
+                DArray H, C, PreH;
+                
+                if (FCellType == TCellType::ctSimpleRNN) {
+                    FSimpleCells[layer].Forward(LayerInput, FStates[layer][0], H, PreH);
+                    FStates[layer][0] = H;
+                    LayerInput = H;
+                    if (layer == 0 || t == 0) {
+                        FCaches[t].H = H;
+                        FCaches[t].PreH = PreH;
+                    }
+                } else if (FCellType == TCellType::ctLSTM) {
+                    DArray FG, IG, CTilde, OG, TanhC;
+                    FLSTMCells[layer].Forward(LayerInput, FStates[layer][0], FStates[layer][1],
+                                              H, C, FG, IG, CTilde, OG, TanhC);
+                    FStates[layer][0] = H;
+                    FStates[layer][1] = C;
+                    LayerInput = H;
+                    if (layer == 0 || t == 0) {
+                        FCaches[t].H = H;
+                        FCaches[t].C = C;
+                        FCaches[t].F = FG;
+                        FCaches[t].I = IG;
+                        FCaches[t].CTilde = CTilde;
+                        FCaches[t].O = OG;
+                        FCaches[t].TanhC = TanhC;
+                    }
+                } else if (FCellType == TCellType::ctGRU) {
+                    DArray Z, R, HTilde;
+                    FGRUCells[layer].Forward(LayerInput, FStates[layer][0], H, Z, R, HTilde);
+                    FStates[layer][0] = H;
+                    LayerInput = H;
+                    if (layer == 0 || t == 0) {
+                        FCaches[t].H = H;
+                        FCaches[t].Z = Z;
+                        FCaches[t].R = R;
+                        FCaches[t].HTilde = HTilde;
+                    }
+                }
+                LayerOutputs[layer] = LayerInput;
+            }
+
+            DArray OutPre, OutVal;
+            FOutputLayer->Forward(LayerInput, OutVal, OutPre);
+            FCaches[t].OutVal = OutVal;
+            FCaches[t].OutPre = OutPre;
+            Outputs[t] = OutVal;
+        }
+
+        if (use_gpu && opencl && opencl->isInitialized()) {
+            opencl->finish();
+        }
+
+        return Outputs;
+    }
+
+    double BackwardSequence(const DArray2D& Targets) {
+        double Loss = 0.0;
+
+        for (int t = 0; t < FSequenceLen; t++) {
+            Loss += ComputeLoss(FCaches[t].OutVal, Targets[t], FLossType);
+        }
+
+        for (int t = FSequenceLen - 1; t >= 0; t--) {
+            DArray dOut(FOutputSize);
+            ComputeLossGradient(FCaches[t].OutVal, Targets[t], FLossType, dOut);
+
+            DArray dLayerInput;
+            FOutputLayer->Backward(dOut, FCaches[t].OutVal, FCaches[t].OutPre,
+                                   FCaches[t].H, FGradientClip, dLayerInput);
+
+            for (int layer = (int)FHiddenSizes.size() - 1; layer >= 0; layer--) {
+                DArray dInput, dPrevH, dPrevC;
+                if (FCellType == TCellType::ctSimpleRNN) {
+                    FSimpleCells[layer].Backward(dLayerInput, FCaches[t].H, FCaches[t].PreH,
+                                                 FStates[layer][0], FCaches[t].Input,
+                                                 FGradientClip, dInput, dPrevH);
+                } else if (FCellType == TCellType::ctLSTM) {
+                    FLSTMCells[layer].Backward(dLayerInput, dPrevC, FCaches[t].H, FCaches[t].C,
+                                               FCaches[t].F, FCaches[t].I, FCaches[t].CTilde,
+                                               FCaches[t].O, FCaches[t].TanhC,
+                                               FStates[layer][0], FStates[layer][1],
+                                               FCaches[t].Input, FGradientClip,
+                                               dInput, dPrevH, dPrevC);
+                } else if (FCellType == TCellType::ctGRU) {
+                    FGRUCells[layer].Backward(dLayerInput, FCaches[t].H, FCaches[t].Z,
+                                              FCaches[t].R, FCaches[t].HTilde,
+                                              FStates[layer][0], FCaches[t].Input,
+                                              FGradientClip, dInput, dPrevH);
+                }
+                dLayerInput = dInput;
+            }
+        }
+
+        if (use_gpu && opencl && opencl->isInitialized()) {
+            opencl->finish();
+        }
+
+        return Loss / FSequenceLen;
+    }
+
+    double TrainSequence(const DArray2D& Inputs, const DArray2D& Targets) {
+        ResetAllStates();
+        DArray2D Outputs = ForwardSequence(Inputs);
+        double Loss = BackwardSequence(Targets);
+        ApplyGradients();
+        return Loss;
+    }
+
+    DArray2D Predict(const DArray2D& Inputs) {
+        ResetAllStates();
+        return ForwardSequence(Inputs);
+    }
+
+    void ResetAllStates(double Value = 0.0) {
+        for (size_t layer = 0; layer < FHiddenSizes.size(); layer++) {
+            for (int i = 0; i < FHiddenSizes[layer]; i++) {
+                FStates[layer][0][i] = Value;
+                if (FCellType == TCellType::ctLSTM)
+                    FStates[layer][1][i] = Value;
+            }
+        }
+    }
+
+    void ResetGradients() {
+        for (auto& cell : FSimpleCells) cell.ResetGradients();
+        for (auto& cell : FLSTMCells) cell.ResetGradients();
+        for (auto& cell : FGRUCells) cell.ResetGradients();
+        if (FOutputLayer) FOutputLayer->ResetGradients();
+    }
+
+    void ApplyGradients() {
+        for (auto& cell : FSimpleCells) cell.ApplyGradients(FLearningRate, FGradientClip);
+        for (auto& cell : FLSTMCells) cell.ApplyGradients(FLearningRate, FGradientClip);
+        for (auto& cell : FGRUCells) cell.ApplyGradients(FLearningRate, FGradientClip);
+        if (FOutputLayer) FOutputLayer->ApplyGradients(FLearningRate, FGradientClip);
+    }
+
+    // ========================================================================
+    // Facade Introspection Methods
+    // ========================================================================
+
+    double GetHiddenValue(int LayerIdx, int Timestep, int NeuronIdx) {
+        if (LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() || 
+            Timestep < 0 || Timestep >= FSequenceLen ||
+            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
+            return 0.0;
+        }
+        return FStates[LayerIdx][0][NeuronIdx];
+    }
+
+    void SetHiddenValue(int LayerIdx, int NeuronIdx, double Value) {
+        if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size() &&
+            NeuronIdx >= 0 && NeuronIdx < FHiddenSizes[LayerIdx]) {
+            FStates[LayerIdx][0][NeuronIdx] = Value;
+        }
+    }
+
+    double GetOutputValue(int Timestep, int OutputIdx) {
+        if (Timestep < 0 || Timestep >= FSequenceLen || OutputIdx < 0 || OutputIdx >= FOutputSize) {
+            return 0.0;
+        }
+        return FCaches[Timestep].OutVal[OutputIdx];
+    }
+
+    double GetCellState(int LayerIdx, int NeuronIdx) {
+        if (FCellType != TCellType::ctLSTM || LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() ||
+            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
+            return 0.0;
+        }
+        return FStates[LayerIdx][1][NeuronIdx];
+    }
+
+    double GetGateValue(int LayerIdx, int Timestep, int NeuronIdx, TGateType Gate) {
+        if (Timestep < 0 || Timestep >= FSequenceLen || LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() ||
+            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
+            return 0.0;
+        }
+
+        if (FCellType == TCellType::ctLSTM && Timestep < (int)FCaches.size()) {
+            switch (Gate) {
+                case TGateType::gtForget: return FCaches[Timestep].F[NeuronIdx];
+                case TGateType::gtInput: return FCaches[Timestep].I[NeuronIdx];
+                case TGateType::gtOutput: return FCaches[Timestep].O[NeuronIdx];
+                case TGateType::gtCellCandidate: return FCaches[Timestep].CTilde[NeuronIdx];
+                default: return 0.0;
+            }
+        } else if (FCellType == TCellType::ctGRU && Timestep < (int)FCaches.size()) {
+            switch (Gate) {
+                case TGateType::gtUpdate: return FCaches[Timestep].Z[NeuronIdx];
+                case TGateType::gtReset: return FCaches[Timestep].R[NeuronIdx];
+                case TGateType::gtHiddenCandidate: return FCaches[Timestep].HTilde[NeuronIdx];
+                default: return 0.0;
+            }
+        }
+        return 0.0;
+    }
+
+    double GetPreactivation(int LayerIdx, int Timestep, int NeuronIdx) {
+        if (Timestep < 0 || Timestep >= FSequenceLen || LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() ||
+            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
+            return 0.0;
+        }
+        return FCaches[Timestep].PreH[NeuronIdx];
+    }
+
+    double GetInputValue(int Timestep, int InputIdx) {
+        if (Timestep < 0 || Timestep >= FSequenceLen || InputIdx < 0 || InputIdx >= FInputSize) {
+            return 0.0;
+        }
+        return FCaches[Timestep].Input[InputIdx];
+    }
+
+    void DetectVanishingGradients(double Threshold, int& Count, double& MinAbsGrad) {
+        Count = 0;
+        MinAbsGrad = 1e10;
+        
+        for (auto& cell : FSimpleCells) {
+            for (auto& grad_row : cell.dWih) {
+                for (double g : grad_row) {
+                    double abs_g = std::abs(g);
+                    if (abs_g < Threshold) Count++;
+                    MinAbsGrad = std::min(MinAbsGrad, abs_g);
+                }
+            }
+        }
+        for (auto& cell : FLSTMCells) {
+            for (auto& grad_row : cell.dWf) {
+                for (double g : grad_row) {
+                    double abs_g = std::abs(g);
+                    if (abs_g < Threshold) Count++;
+                    MinAbsGrad = std::min(MinAbsGrad, abs_g);
+                }
+            }
+        }
+    }
+
+    void DetectExplodingGradients(double Threshold, int& Count, double& MaxAbsGrad) {
+        Count = 0;
+        MaxAbsGrad = 0.0;
+        
+        for (auto& cell : FSimpleCells) {
+            for (auto& grad_row : cell.dWih) {
+                for (double g : grad_row) {
+                    double abs_g = std::abs(g);
+                    if (abs_g > Threshold) Count++;
+                    MaxAbsGrad = std::max(MaxAbsGrad, abs_g);
+                }
+            }
+        }
+        for (auto& cell : FLSTMCells) {
+            for (auto& grad_row : cell.dWf) {
+                for (double g : grad_row) {
+                    double abs_g = std::abs(g);
+                    if (abs_g > Threshold) Count++;
+                    MaxAbsGrad = std::max(MaxAbsGrad, abs_g);
+                }
+            }
+        }
+    }
+
+    DArray2D GetSequenceOutputs() {
+        DArray2D Outputs;
+        for (int t = 0; t < FSequenceLen; t++) {
+            Outputs.push_back(FCaches[t].OutVal);
+        }
+        return Outputs;
+    }
+
+    DArray2D GetSequenceHiddenStates(int LayerIdx) {
+        DArray2D States;
+        if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size()) {
+            for (int t = 0; t < FSequenceLen; t++) {
+                if (t < (int)FCaches.size()) {
+                    States.push_back(FCaches[t].H);
+                }
+            }
+        }
+        return States;
+    }
+
+    int GetLayerCount() const { return FHiddenSizes.size(); }
+    int GetHiddenSize(int LayerIdx) const {
+        if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size())
+            return FHiddenSizes[LayerIdx];
         return 0;
     }
-    // Command parse
-    std::string cmdStr = argv[1];
-    int inputSize = 0, hiddenSize = 0, outputSize = 0, epochs = 100, bpttSteps = 1;
-    std::string modelFile, saveFile, dataFile;
-    float lr = 0.01, clipVal = 1.0;
-    CellType cellType = ctSimpleRNN;
-    LossType lossType = ltMSE;
-    ActivationType hiddenAct = atTanh, outputAct = atSigmoid;
-    bool normalize = false;
+    TCellType GetCellType() const { return FCellType; }
+    int GetSequenceLength() const { return FSequenceLen; }
+    bool isGPUAvailable() const { return use_gpu && opencl && opencl->isInitialized(); }
+    void setUseGPU(bool use) { use_gpu = use; }
+    double getLearningRate() const { return FLearningRate; }
+    void setLearningRate(double value) { FLearningRate = value; }
+    double getGradientClip() const { return FGradientClip; }
+    void setGradientClip(double value) { FGradientClip = value; }
+    double getDropoutRate() const { return FDropoutRate; }
+    void setDropoutRate(double value) { FDropoutRate = value; FUseDropout = value > 0.0; }
 
-    // Simplified argument scan
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
-        size_t eq = arg.find('=');
-        if (eq == std::string::npos) {
-            if (arg == "--normalize") { normalize = true; continue; }
-            continue;
+    // ========================================================================
+    // Model Persistence
+    // ========================================================================
+
+    bool SaveModel(const std::string& Filename) {
+        try {
+            std::ofstream file(Filename, std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "Failed to open file for writing: " << Filename << std::endl;
+                return false;
+            }
+
+            // Write header
+            int cellTypeInt = (int)FCellType;
+            int actTypeInt = (int)FActivation;
+            int outActTypeInt = (int)FOutputActivation;
+            int lossTypeInt = (int)FLossType;
+            int numLayers = FHiddenSizes.size();
+
+            file.write((char*)&FInputSize, sizeof(int));
+            file.write((char*)&FOutputSize, sizeof(int));
+            file.write((char*)&numLayers, sizeof(int));
+            file.write((char*)&cellTypeInt, sizeof(int));
+            file.write((char*)&actTypeInt, sizeof(int));
+            file.write((char*)&outActTypeInt, sizeof(int));
+            file.write((char*)&lossTypeInt, sizeof(int));
+            file.write((char*)&FLearningRate, sizeof(double));
+            file.write((char*)&FGradientClip, sizeof(double));
+
+            // Write hidden sizes
+            for (int h : FHiddenSizes) {
+                file.write((char*)&h, sizeof(int));
+            }
+
+            // Write SimpleRNN cells
+            for (auto& cell : FSimpleCells) {
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < cell.FInputSize; j++) {
+                        file.write((char*)&cell.Wih[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < cell.FHiddenSize; j++) {
+                        file.write((char*)&cell.Whh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    file.write((char*)&cell.Bh[i], sizeof(double));
+                }
+            }
+
+            // Write LSTM cells
+            for (auto& cell : FLSTMCells) {
+                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.write((char*)&cell.Wf[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.write((char*)&cell.Wi[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.write((char*)&cell.Wc[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.write((char*)&cell.Wo[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    file.write((char*)&cell.Bf[i], sizeof(double));
+                    file.write((char*)&cell.Bi[i], sizeof(double));
+                    file.write((char*)&cell.Bc[i], sizeof(double));
+                    file.write((char*)&cell.Bo[i], sizeof(double));
+                }
+            }
+
+            // Write GRU cells
+            for (auto& cell : FGRUCells) {
+                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.write((char*)&cell.Wz[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.write((char*)&cell.Wr[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.write((char*)&cell.Wh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    file.write((char*)&cell.Bz[i], sizeof(double));
+                    file.write((char*)&cell.Br[i], sizeof(double));
+                    file.write((char*)&cell.Bh[i], sizeof(double));
+                }
+            }
+
+            // Write output layer
+            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
+                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
+                    file.write((char*)&FOutputLayer->W[i][j], sizeof(double));
+                }
+            }
+            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
+                file.write((char*)&FOutputLayer->B[i], sizeof(double));
+            }
+
+            file.close();
+            return true;
+        } catch (...) {
+            std::cerr << "Error saving model" << std::endl;
+            return false;
         }
-        std::string key = arg.substr(0, eq);
-        std::string valueStr = arg.substr(eq + 1);
-        if (key == "--input") inputSize = atoi(valueStr.c_str());
-        else if (key == "--hidden") hiddenSize = atoi(valueStr.c_str());
-        else if (key == "--output") outputSize = atoi(valueStr.c_str());
-        else if (key == "--type") cellType = (valueStr=="lstm")?ctLSTM:(valueStr=="gru"?ctGRU:ctSimpleRNN);
-        else if (key == "--loss") lossType = (valueStr=="ce"||valueStr=="crossentropy")?ltCrossEntropy:ltMSE;
-        else if (key == "--save") saveFile = valueStr;
-        else if (key == "--model") modelFile = valueStr;
-        else if (key == "--data") dataFile = valueStr;
-        else if (key == "--epochs") epochs = atoi(valueStr.c_str());
-        else if (key == "--lr") lr = atof(valueStr.c_str());
-        else if (key == "--clip") clipVal = atof(valueStr.c_str());
     }
 
-    // OpenCL device and context setup
-    cl_int err;
-    cl_platform_id platform;
-    cl_device_id device;
-    err = clGetPlatformIDs(1, &platform, NULL); CL_CHECK(err);
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
-    if (err != CL_SUCCESS) { err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL); }
-    CL_CHECK(err);
+    bool LoadModel(const std::string& Filename) {
+        try {
+            std::ifstream file(Filename, std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "Failed to open file for reading: " << Filename << std::endl;
+                return false;
+            }
 
-    cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err); CL_CHECK(err);
-    cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err); CL_CHECK(err);
+            // Read header
+            int cellTypeInt, actTypeInt, outActTypeInt, lossTypeInt, numLayers;
+            file.read((char*)&FInputSize, sizeof(int));
+            file.read((char*)&FOutputSize, sizeof(int));
+            file.read((char*)&numLayers, sizeof(int));
+            file.read((char*)&cellTypeInt, sizeof(int));
+            file.read((char*)&actTypeInt, sizeof(int));
+            file.read((char*)&outActTypeInt, sizeof(int));
+            file.read((char*)&lossTypeInt, sizeof(int));
+            file.read((char*)&FLearningRate, sizeof(double));
+            file.read((char*)&FGradientClip, sizeof(double));
 
+            FCellType = (TCellType)cellTypeInt;
+            FActivation = (TActivationType)actTypeInt;
+            FOutputActivation = (TActivationType)outActTypeInt;
+            FLossType = (TLossType)lossTypeInt;
 
-    cl_program program = clCreateProgramWithSource(context, 1, &kernelSource, NULL, &err);
-    CL_CHECK(err);
+            // Read hidden sizes
+            FHiddenSizes.clear();
+            for (int i = 0; i < numLayers; i++) {
+                int h;
+                file.read((char*)&h, sizeof(int));
+                FHiddenSizes.push_back(h);
+            }
 
-    err = clBuildProgram(program, 1, &device, "-cl-std=CL1.2", NULL, NULL);
-    if (err != CL_SUCCESS) {
-        // Print the build log (always!)
-        size_t log_size = 0;
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
-        std::vector<char> build_log(log_size + 1);
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, build_log.data(), NULL);
-        build_log[log_size] = 0;
-        std::cerr << "\nOpenCL build error (" << err << "):\n" << build_log.data() << std::endl;
+            // Reinitialize cells based on loaded config
+            FSimpleCells.clear();
+            FLSTMCells.clear();
+            FGRUCells.clear();
 
-        // Optionally log the full kernel source, with line numbers, for easier debugging:
-        std::cerr << "\nKernel source was:\n";
-        std::istringstream src(kernelSource);
-        std::string line;
-        int lno = 1;
-        while (std::getline(src, line)) {
-            std::cerr << std::setw(4) << lno++ << ": " << line << '\n';
+            if (FCellType == TCellType::ctSimpleRNN) {
+                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
+                    FSimpleCells.emplace_back(InSize, FHiddenSizes[i], FActivation);
+                }
+            } else if (FCellType == TCellType::ctLSTM) {
+                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
+                    FLSTMCells.emplace_back(InSize, FHiddenSizes[i], FActivation);
+                }
+            } else if (FCellType == TCellType::ctGRU) {
+                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
+                    FGRUCells.emplace_back(InSize, FHiddenSizes[i], FActivation);
+                }
+            }
+
+            if (FOutputLayer) delete FOutputLayer;
+            FOutputLayer = new TOutputLayerWrapper(FHiddenSizes.back(), FOutputSize, FOutputActivation);
+
+            // Read SimpleRNN cells
+            for (auto& cell : FSimpleCells) {
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < cell.FInputSize; j++) {
+                        file.read((char*)&cell.Wih[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < cell.FHiddenSize; j++) {
+                        file.read((char*)&cell.Whh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    file.read((char*)&cell.Bh[i], sizeof(double));
+                }
+            }
+
+            // Read LSTM cells
+            for (auto& cell : FLSTMCells) {
+                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.read((char*)&cell.Wf[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.read((char*)&cell.Wi[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.read((char*)&cell.Wc[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.read((char*)&cell.Wo[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    file.read((char*)&cell.Bf[i], sizeof(double));
+                    file.read((char*)&cell.Bi[i], sizeof(double));
+                    file.read((char*)&cell.Bc[i], sizeof(double));
+                    file.read((char*)&cell.Bo[i], sizeof(double));
+                }
+            }
+
+            // Read GRU cells
+            for (auto& cell : FGRUCells) {
+                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.read((char*)&cell.Wz[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.read((char*)&cell.Wr[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    for (int j = 0; j < inputPlusHidden; j++) {
+                        file.read((char*)&cell.Wh[i][j], sizeof(double));
+                    }
+                }
+                for (int i = 0; i < cell.FHiddenSize; i++) {
+                    file.read((char*)&cell.Bz[i], sizeof(double));
+                    file.read((char*)&cell.Br[i], sizeof(double));
+                    file.read((char*)&cell.Bh[i], sizeof(double));
+                }
+            }
+
+            // Read output layer
+            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
+                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
+                    file.read((char*)&FOutputLayer->W[i][j], sizeof(double));
+                }
+            }
+            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
+                file.read((char*)&FOutputLayer->B[i], sizeof(double));
+            }
+
+            file.close();
+            FStates = InitHiddenStates();
+            return true;
+        } catch (...) {
+            std::cerr << "Error loading model" << std::endl;
+            return false;
         }
-        exit(1);
     }
+};
 
-    // Kernel objects
-    #define KMAKE(name) clCreateKernel(program, name, &err); CL_CHECK(err)
-    cl_kernel k_simple_rnn_forward = KMAKE("k_simple_rnn_forward");
-    cl_kernel k_lstm_forward       = KMAKE("k_lstm_forward");
-    cl_kernel k_gru_gates          = KMAKE("k_gru_forward_gates");
-    cl_kernel k_gru_hidden         = KMAKE("k_gru_forward_hidden");
-    cl_kernel k_output_forward     = KMAKE("k_output_forward");
-    cl_kernel k_zero               = KMAKE("k_zero_array");
-    cl_kernel k_fill               = KMAKE("k_fill_array");
-    cl_kernel k_concat             = KMAKE("k_concat");
+// ============================================================================
+// CLI Entry Point
+// ============================================================================
 
-    // Model construction
-    RNNModelOpenCL model(inputSize, hiddenSize, outputSize, hiddenAct, outputAct, lossType,
-                         cellType, lr, clipVal, bpttSteps, context, queue,
-                         k_simple_rnn_forward, k_lstm_forward, k_gru_gates, k_gru_hidden,
-                         k_output_forward, k_concat, k_zero, k_fill);
-
-    // Command dispatcher
-    if (cmdStr == "create") {
-        if (!inputSize || !hiddenSize || !outputSize || saveFile.empty()) {
-            std::cout << "Missing parameters for create\n"; return 1;
-        }
-        // Save model weights (add serialization)
-        std::cout << "Model created. (Saving model logic not shown)\n";
-    }
-    else if (cmdStr == "predict") {
-        // load model & data, run model.ForwardSequence(...)
-        std::cout << "Prediction command not fully implemented.\n";
-    }
-    else if (cmdStr == "train") {
-        std::cout << "Train command not fully implemented.\n";
-    }
-    else if (cmdStr == "info") {
-        std::cout << "Model info: input=" << model.GetInputSize()
-        << " hidden="  << model.GetHiddenSize()
-        << " output="  << model.GetOutputSize()
-        << " type="    << model.GetCellType() << "\n";
-    }
-    else if (cmdStr == "help") {
-        std::cout << "Help: usage instructions ...\n";
-    }
-
-    // Cleanup
-    clReleaseKernel(k_simple_rnn_forward);
-    clReleaseKernel(k_lstm_forward);
-    clReleaseKernel(k_gru_gates);
-    clReleaseKernel(k_gru_hidden);
-    clReleaseKernel(k_output_forward);
-    clReleaseKernel(k_zero);
-    clReleaseKernel(k_fill);
-    clReleaseKernel(k_concat);
-    clReleaseProgram(program);
-    clReleaseCommandQueue(queue);
-    clReleaseContext(context);
-    return 0;
+void ShowHelp(const char* progName) {
+    std::cout << "RNN Facade CLI (OpenCL GPU) - Matthew Abbott 2025" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Usage: " << progName << " <command> [options]" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Commands:" << std::endl;
+    std::cout << "  create              Create and initialize an RNN model" << std::endl;
+    std::cout << "  train               Train the model on data" << std::endl;
+    std::cout << "  predict             Run prediction on input data" << std::endl;
+    std::cout << "  save                Save model weights to file" << std::endl;
+    std::cout << "  load                Load model weights from file" << std::endl;
+    std::cout << "  info                Display GPU information" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Facade Introspection Commands:" << std::endl;
+    std::cout << "  get-hidden          Get hidden state value" << std::endl;
+    std::cout << "  set-hidden          Set hidden state value" << std::endl;
+    std::cout << "  get-output          Get output value at timestep" << std::endl;
+    std::cout << "  get-cell-state      Get LSTM cell state" << std::endl;
+    std::cout << "  get-gate            Get gate value (LSTM/GRU)" << std::endl;
+    std::cout << "  get-preactivation   Get pre-activation value" << std::endl;
+    std::cout << "  get-input           Get input vector value" << std::endl;
+    std::cout << "  reset-states        Reset all hidden/cell states" << std::endl;
+    std::cout << "  set-dropout         Set dropout rate" << std::endl;
+    std::cout << "  get-dropout         Get current dropout rate" << std::endl;
+    std::cout << "  detect-vanishing    Check for vanishing gradients" << std::endl;
+    std::cout << "  detect-exploding    Check for exploding gradients" << std::endl;
+    std::cout << "  get-seq-outputs     Get all outputs for a sequence" << std::endl;
+    std::cout << "  get-seq-hidden      Get hidden states over sequence" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Create/Train/Predict options:" << std::endl;
+    std::cout << "  --input-size <n>       Input dimension (required)" << std::endl;
+    std::cout << "  --hidden-sizes <n,n>   Comma-separated hidden layer sizes (required)" << std::endl;
+    std::cout << "  --output-size <n>      Output dimension (required)" << std::endl;
+    std::cout << "  --cell-type <type>     rnn, lstm, or gru (default: lstm)" << std::endl;
+    std::cout << "  --activation <type>    sigmoid, tanh, relu, linear (default: tanh)" << std::endl;
+    std::cout << "  --output-activation    Output layer activation (default: sigmoid)" << std::endl;
+    std::cout << "  --loss <type>          mse or crossentropy (default: mse)" << std::endl;
+    std::cout << "  --learning-rate <f>    Learning rate (default: 0.01)" << std::endl;
+    std::cout << "  --gradient-clip <f>    Gradient clipping value (default: 5.0)" << std::endl;
+    std::cout << "  --bptt-steps <n>       BPTT truncation steps (default: 0 = full)" << std::endl;
+    std::cout << "  --epochs <n>           Number of training epochs (default: 100)" << std::endl;
+    std::cout << "  --input-file <file>    CSV file with input sequences" << std::endl;
+    std::cout << "  --target-file <file>   CSV file with target sequences" << std::endl;
+    std::cout << "  --output-file <file>   CSV file to write predictions" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Facade options:" << std::endl;
+    std::cout << "  --layer <n>            Layer index (default: 0)" << std::endl;
+    std::cout << "  --timestep <n>         Timestep index (default: 0)" << std::endl;
+    std::cout << "  --neuron <n>           Neuron index (default: 0)" << std::endl;
+    std::cout << "  --output-idx <n>       Output index (default: 0)" << std::endl;
+    std::cout << "  --value <f>            Value to set" << std::endl;
+    std::cout << "  --gate <type>          Gate type: forget,input,output,cell,update,reset,hidden" << std::endl;
+    std::cout << "  --threshold <f>        Threshold for gradient detection (default: 1e-6)" << std::endl;
 }
 
+TCellType ParseCellType(const std::string& str) {
+    if (str == "rnn") return TCellType::ctSimpleRNN;
+    if (str == "lstm") return TCellType::ctLSTM;
+    if (str == "gru") return TCellType::ctGRU;
+    return TCellType::ctLSTM;
+}
+
+TActivationType ParseActivation(const std::string& str) {
+    if (str == "sigmoid") return TActivationType::atSigmoid;
+    if (str == "tanh") return TActivationType::atTanh;
+    if (str == "relu") return TActivationType::atReLU;
+    if (str == "linear") return TActivationType::atLinear;
+    return TActivationType::atTanh;
+}
+
+TLossType ParseLossType(const std::string& str) {
+    if (str == "mse") return TLossType::ltMSE;
+    if (str == "crossentropy") return TLossType::ltCrossEntropy;
+    return TLossType::ltMSE;
+}
+
+TGateType ParseGateType(const std::string& str) {
+    if (str == "forget") return TGateType::gtForget;
+    if (str == "input") return TGateType::gtInput;
+    if (str == "output") return TGateType::gtOutput;
+    if (str == "cell") return TGateType::gtCellCandidate;
+    if (str == "update") return TGateType::gtUpdate;
+    if (str == "reset") return TGateType::gtReset;
+    if (str == "hidden") return TGateType::gtHiddenCandidate;
+    return TGateType::gtForget;
+}
+
+std::vector<int> ParseHiddenSizes(const std::string& str) {
+    std::vector<int> result;
+    std::stringstream ss(str);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        result.push_back(std::stoi(item));
+    }
+    return result.empty() ? std::vector<int>{64, 32} : result;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        ShowHelp(argv[0]);
+        return 0;
+    }
+
+    std::string command = argv[1];
+
+    // Default parameters
+    int InputSize = 10;
+    std::vector<int> HiddenSizes = {64, 32};
+    int OutputSize = 5;
+    TCellType CellType = TCellType::ctLSTM;
+    TActivationType Activation = TActivationType::atTanh;
+    TActivationType OutputActivation = TActivationType::atSigmoid;
+    TLossType LossType = TLossType::ltMSE;
+    double LearningRate = 0.01;
+    double GradientClip = 5.0;
+    int BPTTSteps = 0;
+    int Epochs = 100;
+
+    // Introspection parameters
+    int LayerIdx = 0;
+    int Timestep = 0;
+    int NeuronIdx = 0;
+    int OutputIdx = 0;
+    double Value = 0.0;
+    TGateType Gate = TGateType::gtForget;
+    double Threshold = 1e-6;
+
+    std::string InputFile, TargetFile, OutputFile, ModelFile;
+
+    // Parse command-specific arguments
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if ((arg == "--help" || arg == "-h") && command == "create") {
+            ShowHelp(argv[0]);
+            return 0;
+        }
+        else if (arg == "--input-size" && i + 1 < argc) {
+            InputSize = std::stoi(argv[++i]);
+        }
+        else if (arg == "--hidden-sizes" && i + 1 < argc) {
+            HiddenSizes = ParseHiddenSizes(argv[++i]);
+        }
+        else if (arg == "--output-size" && i + 1 < argc) {
+            OutputSize = std::stoi(argv[++i]);
+        }
+        else if (arg == "--cell-type" && i + 1 < argc) {
+            CellType = ParseCellType(argv[++i]);
+        }
+        else if (arg == "--activation" && i + 1 < argc) {
+            Activation = ParseActivation(argv[++i]);
+        }
+        else if (arg == "--output-activation" && i + 1 < argc) {
+            OutputActivation = ParseActivation(argv[++i]);
+        }
+        else if (arg == "--loss" && i + 1 < argc) {
+            LossType = ParseLossType(argv[++i]);
+        }
+        else if (arg == "--learning-rate" && i + 1 < argc) {
+            LearningRate = std::stod(argv[++i]);
+        }
+        else if (arg == "--gradient-clip" && i + 1 < argc) {
+            GradientClip = std::stod(argv[++i]);
+        }
+        else if (arg == "--bptt-steps" && i + 1 < argc) {
+            BPTTSteps = std::stoi(argv[++i]);
+        }
+        else if (arg == "--epochs" && i + 1 < argc) {
+            Epochs = std::stoi(argv[++i]);
+        }
+        else if (arg == "--input-file" && i + 1 < argc) {
+            InputFile = argv[++i];
+        }
+        else if (arg == "--target-file" && i + 1 < argc) {
+            TargetFile = argv[++i];
+        }
+        else if (arg == "--output-file" && i + 1 < argc) {
+            OutputFile = argv[++i];
+        }
+        else if (arg == "--model-file" && i + 1 < argc) {
+            ModelFile = argv[++i];
+        }
+        else if (arg == "--layer" && i + 1 < argc) {
+            LayerIdx = std::stoi(argv[++i]);
+        }
+        else if (arg == "--timestep" && i + 1 < argc) {
+            Timestep = std::stoi(argv[++i]);
+        }
+        else if (arg == "--neuron" && i + 1 < argc) {
+            NeuronIdx = std::stoi(argv[++i]);
+        }
+        else if (arg == "--output-idx" && i + 1 < argc) {
+            OutputIdx = std::stoi(argv[++i]);
+        }
+        else if (arg == "--value" && i + 1 < argc) {
+            Value = std::stod(argv[++i]);
+        }
+        else if (arg == "--gate" && i + 1 < argc) {
+            Gate = ParseGateType(argv[++i]);
+        }
+        else if (arg == "--threshold" && i + 1 < argc) {
+            Threshold = std::stod(argv[++i]);
+        }
+    }
+
+    // Create RNN instance
+    TRNNFacadeOpenCL rnn(InputSize, HiddenSizes, OutputSize, CellType,
+                         Activation, OutputActivation, LossType, LearningRate,
+                         GradientClip, BPTTSteps, true);
+
+    // Execute command
+    if (command == "create") {
+        std::cout << "RNN Facade CLI (OpenCL GPU) - Matthew Abbott 2025" << std::endl;
+        std::cout << "Model created:" << std::endl;
+        std::cout << "  Input Size: " << InputSize << std::endl;
+        std::cout << "  Hidden Sizes: ";
+        for (int h : HiddenSizes) std::cout << h << " ";
+        std::cout << std::endl;
+        std::cout << "  Output Size: " << OutputSize << std::endl;
+        std::cout << "  Cell Type: " << (int)CellType << std::endl;
+        std::cout << "  GPU Available: " << (rnn.isGPUAvailable() ? "Yes" : "No") << std::endl;
+    }
+    else if (command == "info") {
+        std::cout << "GPU Information:" << std::endl;
+        std::cout << "  Available: " << (rnn.isGPUAvailable() ? "Yes" : "No") << std::endl;
+        std::cout << "  Layers: " << rnn.GetLayerCount() << std::endl;
+        std::cout << "  Cell Type: " << (int)rnn.GetCellType() << std::endl;
+        std::cout << "  Learning Rate: " << rnn.getLearningRate() << std::endl;
+    }
+    else if (command == "get-hidden") {
+        double val = rnn.GetHiddenValue(LayerIdx, Timestep, NeuronIdx);
+        std::cout << "Hidden[" << LayerIdx << "][" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
+    }
+    else if (command == "set-hidden") {
+        rnn.SetHiddenValue(LayerIdx, NeuronIdx, Value);
+        std::cout << "Set hidden[" << LayerIdx << "][" << NeuronIdx << "] = " << Value << std::endl;
+    }
+    else if (command == "get-output") {
+        double val = rnn.GetOutputValue(Timestep, OutputIdx);
+        std::cout << "Output[" << Timestep << "][" << OutputIdx << "] = " << val << std::endl;
+    }
+    else if (command == "get-cell-state") {
+        double val = rnn.GetCellState(LayerIdx, NeuronIdx);
+        std::cout << "CellState[" << LayerIdx << "][" << NeuronIdx << "] = " << val << std::endl;
+    }
+    else if (command == "get-gate") {
+        double val = rnn.GetGateValue(LayerIdx, Timestep, NeuronIdx, Gate);
+        std::cout << "Gate[" << LayerIdx << "][" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
+    }
+    else if (command == "get-preactivation") {
+        double val = rnn.GetPreactivation(LayerIdx, Timestep, NeuronIdx);
+        std::cout << "Preactivation[" << LayerIdx << "][" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
+    }
+    else if (command == "get-input") {
+        double val = rnn.GetInputValue(Timestep, NeuronIdx);
+        std::cout << "Input[" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
+    }
+    else if (command == "reset-states") {
+        rnn.ResetAllStates(Value);
+        std::cout << "All states reset to " << Value << std::endl;
+    }
+    else if (command == "set-dropout") {
+        rnn.setDropoutRate(Value);
+        std::cout << "Dropout rate set to " << Value << std::endl;
+    }
+    else if (command == "get-dropout") {
+        std::cout << "Current dropout rate: " << rnn.getDropoutRate() << std::endl;
+    }
+    else if (command == "detect-vanishing") {
+        int count;
+        double minGrad;
+        rnn.DetectVanishingGradients(Threshold, count, minGrad);
+        std::cout << "Vanishing gradients detected: " << count << " values below " << Threshold << std::endl;
+        std::cout << "Minimum absolute gradient: " << minGrad << std::endl;
+    }
+    else if (command == "detect-exploding") {
+        int count;
+        double maxGrad;
+        rnn.DetectExplodingGradients(Threshold, count, maxGrad);
+        std::cout << "Exploding gradients detected: " << count << " values above " << Threshold << std::endl;
+        std::cout << "Maximum absolute gradient: " << maxGrad << std::endl;
+    }
+    else if (command == "get-seq-outputs") {
+        DArray2D outputs = rnn.GetSequenceOutputs();
+        std::cout << "Sequence outputs (" << outputs.size() << " timesteps, " 
+                  << (outputs.empty() ? 0 : outputs[0].size()) << " dimensions each):" << std::endl;
+        for (size_t t = 0; t < outputs.size(); t++) {
+            std::cout << "  T" << t << ": ";
+            for (double v : outputs[t]) std::cout << v << " ";
+            std::cout << std::endl;
+        }
+    }
+    else if (command == "get-seq-hidden") {
+        DArray2D states = rnn.GetSequenceHiddenStates(LayerIdx);
+        std::cout << "Hidden states for layer " << LayerIdx << " (" << states.size() 
+                  << " timesteps, " << (states.empty() ? 0 : states[0].size()) << " hidden units):" << std::endl;
+        for (size_t t = 0; t < states.size(); t++) {
+            std::cout << "  T" << t << ": ";
+            for (double v : states[t]) std::cout << v << " ";
+            std::cout << std::endl;
+        }
+    }
+    else if (command == "save") {
+        if (ModelFile.empty()) {
+            std::cerr << "Error: --model-file required for save command" << std::endl;
+            return 1;
+        }
+        if (rnn.SaveModel(ModelFile)) {
+            std::cout << "Model saved to " << ModelFile << std::endl;
+        } else {
+            std::cerr << "Failed to save model" << std::endl;
+            return 1;
+        }
+    }
+    else if (command == "load") {
+        if (ModelFile.empty()) {
+            std::cerr << "Error: --model-file required for load command" << std::endl;
+            return 1;
+        }
+        if (rnn.LoadModel(ModelFile)) {
+            std::cout << "Model loaded from " << ModelFile << std::endl;
+            std::cout << "Model architecture:" << std::endl;
+            std::cout << "  Input Size: " << InputSize << std::endl;
+            std::cout << "  Output Size: " << rnn.GetLayerCount() << " layers" << std::endl;
+        } else {
+            std::cerr << "Failed to load model" << std::endl;
+            return 1;
+        }
+    }
+    else {
+        std::cerr << "Unknown command: " << command << std::endl;
+        ShowHelp(argv[0]);
+        return 1;
+    }
+
+    return 0;
+}
