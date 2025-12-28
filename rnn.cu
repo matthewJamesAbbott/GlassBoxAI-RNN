@@ -1,7 +1,6 @@
 //
 // Matthew Abbott  2025
 // Advanced RNN with BPTT, Gradient Clipping, LSTM/GRU, Batch Processing
-// CUDA port from C++
 //
 
 #include <iostream>
