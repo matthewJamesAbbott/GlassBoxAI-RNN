@@ -284,15 +284,6 @@ All versions are meant to be highly readable and extensible, prioritizing clarit
 
 ---
 
-## Data Structures & Internals
-
-- **Enums:** `TCellType`, `TActivationType`, `TLossType`
-- **Cell classes:** Separate for SimpleRNN, LSTM, GRU, and Output
-- **Memory utilities:** `DeviceArray`, `GPUMatrix`, `CLArray`, etc. for easy CUDA/OpenCL host-device access
-- **Introspection:** All activations, gradients, and network states are accessible to users (especially in the facade builds)
-
----
-
 ## License
 
 MIT License  
