@@ -1577,7 +1577,7 @@ void SplitData(const TDArray2D& Inputs, const TDArray2D& Targets, double ValSpli
 
 // ========== CLI Helpers ==========
 void ShowHelp() {
-    cout << "RNN CUDA - Matthew Abbott 2025" << endl;
+    cout << "RNN CUDA" << endl;
     cout << "Advanced RNN with BPTT, Gradient Clipping, LSTM/GRU, Batch Processing" << endl;
     cout << endl;
     cout << "Usage: rnn_cuda [OPTIONS]" << endl;
