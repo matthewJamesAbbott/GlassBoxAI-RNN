@@ -275,13 +275,6 @@ Facade options:
 
 ---
 
-## Architecture Notes
-
-- **Direct** (`rnn.cu`, `rnn_opencl.cpp`): Lower-abstraction, classic training loops, best for simple or "production" custom scripts.
-- **Facade** (`facaded_rnn.cu`, `facaded_rnn_opencl.cpp`): Designed for deep research, teaching, and introspection—run, hack, and inspect.
-
----
-
 ## License
 
 MIT License  
