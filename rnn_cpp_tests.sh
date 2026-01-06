@@ -32,7 +32,7 @@ mkdir -p "$TEMP_DIR"
 
 # Compile C++ binaries
 g++ -std=c++17 -O2 rnn.cpp -o rnn
-g++ -std=c++17 -O2 FacadeRNN.cpp -o facade_rnn
+g++ -std=c++17 -O2 facaded_rnn.cpp -o facade_rnn
 
 # Test function
 run_test() {
@@ -117,7 +117,7 @@ if [ ! -f "$RNN_BIN" ]; then
 fi
 
 if [ ! -f "$FACADE_BIN" ]; then
-    echo -e "${RED}Error: $FACADE_BIN not found. Compile with: g++ -std=c++17 -O2 FacadeRNN.cpp -o facade_rnn${NC}"
+    echo -e "${RED}Error: $FACADE_BIN not found. Compile with: g++ -std=c++17 -O2 facaded_rnn.cpp -o facade_rnn${NC}"
     exit 1
 fi
 
