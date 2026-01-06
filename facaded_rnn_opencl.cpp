@@ -1,63 +1,64 @@
-//
-// Facaded RNN
-// Matthew Abbott 2025
-//
+/*
+ * MIT License
+ *
+ * Copyright (c) 2025 Matthew Abbott
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
 #include <iostream>
 #include <vector>
 #include <cmath>
-#include <cstring>
 #include <random>
-#include <algorithm>
-#include <fstream>
+#include <string>
 #include <sstream>
-#include <unordered_map>
-#include <memory>
+#include <fstream>
+#include <algorithm>
+#include <limits>
+#include <iomanip>
+#include <cstdio>
+
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
 #include <CL/cl.h>
+#endif
 
-// ============================================================================
-// Type Definitions
-// ============================================================================
-
+// ========== Type Aliases ==========
 using DArray = std::vector<double>;
-using DArray2D = std::vector<DArray>;
-using DArray3D = std::vector<DArray2D>;
+using TDArray2D = std::vector<DArray>;
+using TDArray3D = std::vector<TDArray2D>;
+using TIntArray = std::vector<int>;
 
-enum class TActivationType {
-    atSigmoid,
-    atTanh,
-    atReLU,
-    atLinear
-};
+// ========== Enums ==========
+enum TActivationType { atSigmoid, atTanh, atReLU, atLinear };
+enum TLossType { ltMSE, ltCrossEntropy };
+enum TCellType { ctSimpleRNN, ctLSTM, ctGRU };
+enum TGateType { gtForget, gtInput, gtOutput, gtCellCandidate, gtUpdate, gtReset, gtHiddenCandidate };
+enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdQuery, cmdHelp };
 
-enum class TLossType {
-    ltMSE,
-    ltCrossEntropy
-};
-
-enum class TCellType {
-    ctSimpleRNN,
-    ctLSTM,
-    ctGRU
-};
-
-enum class TGateType {
-    gtForget,
-    gtInput,
-    gtOutput,
-    gtCellCandidate,
-    gtUpdate,
-    gtReset,
-    gtHiddenCandidate
-};
-
+// ========== Data Structures ==========
 struct THistogramBin {
-    double RangeMin;
-    double RangeMax;
+    double RangeMin, RangeMax;
     int Count;
     double Percentage;
 };
-using THistogram = std::vector<THistogramBin>;
 
 struct TGateSaturationStats {
     int NearZeroCount;
@@ -73,7 +74,6 @@ struct TGradientScaleStats {
     double MaxAbsGrad;
     double MinAbsGrad;
 };
-using TGradientScaleArray = std::vector<TGradientScaleStats>;
 
 struct TLayerNormStats {
     double Mean;
@@ -98,267 +98,20 @@ struct TTimeStepCacheEx {
     DArray OutPre, OutVal;
     DArray DropoutMask;
 };
-using TTimeStepCacheExArray = std::vector<TTimeStepCacheEx>;
 
-// ============================================================================
-// OpenCL Utility Class
-// ============================================================================
+// ========== Forward Declarations ==========
+std::string CellTypeToStr(TCellType ct);
+std::string ActivationToStr(TActivationType act);
+std::string LossToStr(TLossType loss);
+TCellType ParseCellType(const std::string& s);
+TActivationType ParseActivation(const std::string& s);
+TLossType ParseLoss(const std::string& s);
+bool ParseIntArrayHelper(const std::string& s, TIntArray& arr);
+void ParseDoubleArrayHelper(const std::string& s, DArray& arr);
+void LoadDataFromCSV(const std::string& filename, TDArray2D& inputs, TDArray2D& targets);
+void PrintUsage();
 
-class OpenCLUtil {
-private:
-    cl_platform_id platform;
-    cl_device_id device;
-    cl_context context;
-    cl_command_queue queue;
-    bool initialized;
-
-public:
-    OpenCLUtil() : initialized(false) {}
-
-    ~OpenCLUtil() {
-        cleanup();
-    }
-
-    bool initialize(bool verbose = true) {
-        try {
-            cl_int err;
-
-            err = clGetPlatformIDs(1, &platform, nullptr);
-            if (err != CL_SUCCESS) {
-                if (verbose) std::cerr << "Failed to get platform: " << err << std::endl;
-                return false;
-            }
-
-            err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
-            if (err != CL_SUCCESS) {
-                err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, nullptr);
-                if (err != CL_SUCCESS) {
-                    if (verbose) std::cerr << "Failed to get device: " << err << std::endl;
-                    return false;
-                }
-                if (verbose) std::cout << "Using CPU device" << std::endl;
-            } else {
-                if (verbose) std::cout << "Using GPU device" << std::endl;
-            }
-
-            context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
-            if (err != CL_SUCCESS) {
-                if (verbose) std::cerr << "Failed to create context: " << err << std::endl;
-                return false;
-            }
-
-            #ifdef CL_VERSION_2_0
-                cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, 0, 0};
-                queue = clCreateCommandQueueWithProperties(context, device, props, &err);
-            #else
-                queue = clCreateCommandQueue(context, device, 0, &err);
-            #endif
-            if (err != CL_SUCCESS) {
-                if (verbose) std::cerr << "Failed to create command queue: " << err << std::endl;
-                clReleaseContext(context);
-                return false;
-            }
-
-            if (verbose) {
-                char name[256] = {0};
-                clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
-                std::cout << "OpenCL device: " << name << std::endl;
-                
-                cl_ulong mem_size;
-                clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(mem_size), &mem_size, nullptr);
-                std::cout << "GPU Global Memory: " << (mem_size / (1024UL * 1024UL * 1024UL)) << " GB" << std::endl;
-                std::cout << "OpenCL initialized successfully" << std::endl;
-            }
-
-            initialized = true;
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    cl_program createProgram(const std::string& source) {
-        if (!initialized) return nullptr;
-
-        cl_int err;
-        const char* src = source.c_str();
-        size_t len = source.length();
-
-        cl_program program = clCreateProgramWithSource(context, 1, &src, &len, &err);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to create program: " << err << std::endl;
-            return nullptr;
-        }
-
-        err = clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to build program: " << err << std::endl;
-            
-            size_t log_size;
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
-            std::vector<char> log(log_size);
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
-            std::cerr << "Build log:\n" << std::string(log.begin(), log.end()) << std::endl;
-            
-            clReleaseProgram(program);
-            return nullptr;
-        }
-
-        return program;
-    }
-
-    cl_kernel createKernel(cl_program program, const std::string& kernel_name) {
-        if (!initialized) return nullptr;
-
-        cl_int err;
-        cl_kernel kernel = clCreateKernel(program, kernel_name.c_str(), &err);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to create kernel '" << kernel_name << "': " << err << std::endl;
-            return nullptr;
-        }
-        return kernel;
-    }
-
-    cl_mem createBuffer(size_t size, cl_mem_flags flags = CL_MEM_READ_WRITE) {
-        if (!initialized) return nullptr;
-
-        cl_int err;
-        cl_mem buffer = clCreateBuffer(context, flags, size, nullptr, &err);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to create buffer of size " << size << ": " << err << std::endl;
-            return nullptr;
-        }
-        return buffer;
-    }
-
-    bool writeBuffer(cl_mem buffer, size_t size, const void* data) {
-        if (!initialized) return false;
-
-        cl_int err = clEnqueueWriteBuffer(queue, buffer, CL_TRUE, 0, size, data, 0, nullptr, nullptr);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to write buffer: " << err << std::endl;
-            return false;
-        }
-        return true;
-    }
-
-    bool readBuffer(cl_mem buffer, size_t size, void* data) {
-        if (!initialized) return false;
-
-        cl_int err = clEnqueueReadBuffer(queue, buffer, CL_TRUE, 0, size, data, 0, nullptr, nullptr);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to read buffer: " << err << std::endl;
-            return false;
-        }
-        return true;
-    }
-
-    bool finish() {
-        if (!initialized) return false;
-
-        cl_int err = clFinish(queue);
-        if (err != CL_SUCCESS) {
-            std::cerr << "Failed to finish queue: " << err << std::endl;
-            return false;
-        }
-        return true;
-    }
-
-    cl_context getContext() const { return context; }
-    cl_command_queue getQueue() const { return queue; }
-    cl_device_id getDevice() const { return device; }
-    bool isInitialized() const { return initialized; }
-
-    void cleanup() {
-        if (queue) clReleaseCommandQueue(queue);
-        if (context) clReleaseContext(context);
-    }
-};
-
-// ============================================================================
-// GPU Buffer Classes
-// ============================================================================
-
-class GPUBuffer {
-private:
-    cl_mem buffer;
-    size_t size;
-    OpenCLUtil* opencl;
-
-public:
-    GPUBuffer(OpenCLUtil* ocl, size_t sz) : opencl(ocl), size(sz) {
-        buffer = opencl->createBuffer(sz * sizeof(double));
-    }
-
-    ~GPUBuffer() {
-        if (buffer) clReleaseMemObject(buffer);
-    }
-
-    void upload(const double* data) {
-        opencl->writeBuffer(buffer, size * sizeof(double), data);
-    }
-
-    void download(double* data) {
-        opencl->readBuffer(buffer, size * sizeof(double), data);
-    }
-
-    cl_mem getHandle() const { return buffer; }
-    size_t getSize() const { return size; }
-    bool isValid() const { return buffer != nullptr; }
-};
-
-class GPUMatrix {
-private:
-    cl_mem buffer;
-    int rows, cols;
-    OpenCLUtil* opencl;
-
-public:
-    GPUMatrix(OpenCLUtil* ocl, int r, int c) 
-        : opencl(ocl), rows(r), cols(c) {
-        buffer = opencl->createBuffer(r * c * sizeof(double));
-    }
-
-    ~GPUMatrix() {
-        if (buffer) clReleaseMemObject(buffer);
-    }
-
-    void upload(const DArray2D& data) {
-        std::vector<double> flat(rows * cols);
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < cols; j++) {
-                flat[i * cols + j] = data[i][j];
-            }
-        }
-        opencl->writeBuffer(buffer, rows * cols * sizeof(double), flat.data());
-    }
-
-    void download(DArray2D& data) {
-        std::vector<double> flat(rows * cols);
-        opencl->readBuffer(buffer, rows * cols * sizeof(double), flat.data());
-        data.resize(rows);
-        for (int i = 0; i < rows; i++) {
-            data[i].resize(cols);
-            for (int j = 0; j < cols; j++) {
-                data[i][j] = flat[i * cols + j];
-            }
-        }
-    }
-
-    cl_mem getHandle() const { return buffer; }
-    int getRows() const { return rows; }
-    int getCols() const { return cols; }
-    bool isValid() const { return buffer != nullptr; }
-};
-
-// ============================================================================
-// RNN Cell Wrappers
-// ============================================================================
-
-static std::random_device rd;
-static std::mt19937 gen(rd());
-static std::uniform_real_distribution<> dis(0.0, 1.0);
-
+// ========== Utility Functions ==========
 double ClipValue(double V, double MaxVal) {
     if (V > MaxVal) return MaxVal;
     if (V < -MaxVal) return -MaxVal;
@@ -366,86 +119,162 @@ double ClipValue(double V, double MaxVal) {
 }
 
 double RandomWeight(double Scale) {
+    static std::mt19937 gen(std::random_device{}());
+    static std::uniform_real_distribution<> dis(0.0, 1.0);
     return (dis(gen) - 0.5) * 2.0 * Scale;
 }
 
-void InitMatrix(DArray2D& M, int Rows, int Cols, double Scale) {
+void InitMatrix(TDArray2D& M, int Rows, int Cols, double Scale) {
     M.resize(Rows);
-    for (int i = 0; i < Rows; i++) {
+    for (int i = 0; i < Rows; ++i) {
         M[i].resize(Cols);
-        for (int j = 0; j < Cols; j++) {
+        for (int j = 0; j < Cols; ++j) {
             M[i][j] = RandomWeight(Scale);
         }
     }
 }
 
-void ZeroMatrix(DArray2D& M, int Rows, int Cols) {
+void ZeroMatrix(TDArray2D& M, int Rows, int Cols) {
     M.resize(Rows);
-    for (int i = 0; i < Rows; i++) {
-        M[i].resize(Cols, 0.0);
+    for (int i = 0; i < Rows; ++i) {
+        M[i].resize(Cols);
+        for (int j = 0; j < Cols; ++j) {
+            M[i][j] = 0.0;
+        }
     }
 }
 
 void ZeroArray(DArray& A, int Size) {
-    A.resize(Size, 0.0);
+    A.resize(Size);
+    for (int i = 0; i < Size; ++i) {
+        A[i] = 0.0;
+    }
 }
 
 DArray ConcatArrays(const DArray& A, const DArray& B) {
     DArray Result(A.size() + B.size());
-    std::copy(A.begin(), A.end(), Result.begin());
-    std::copy(B.begin(), B.end(), Result.begin() + A.size());
+    for (size_t i = 0; i < A.size(); ++i) {
+        Result[i] = A[i];
+    }
+    for (size_t i = 0; i < B.size(); ++i) {
+        Result[A.size() + i] = B[i];
+    }
     return Result;
 }
 
-double ApplyActivation(double X, TActivationType ActType) {
-    switch (ActType) {
-        case TActivationType::atSigmoid:
-            X = std::max(-500.0, std::min(500.0, X));
-            return 1.0 / (1.0 + std::exp(-X));
-        case TActivationType::atTanh:
-            return std::tanh(X);
-        case TActivationType::atReLU:
-            return X > 0 ? X : 0;
-        case TActivationType::atLinear:
-            return X;
-        default:
-            return X;
+// ========== Activation Functions ==========
+class TActivation {
+public:
+    static double Apply(double X, TActivationType ActType) {
+        switch (ActType) {
+            case atSigmoid:
+                return 1.0 / (1.0 + std::exp(-std::max(-500.0, std::min(500.0, X))));
+            case atTanh:
+                return std::tanh(X);
+            case atReLU:
+                return X > 0 ? X : 0;
+            case atLinear:
+                return X;
+            default:
+                return X;
+        }
     }
-}
 
-double ActivationDerivative(double Y, TActivationType ActType) {
-    switch (ActType) {
-        case TActivationType::atSigmoid:
-            return Y * (1.0 - Y);
-        case TActivationType::atTanh:
-            return 1.0 - Y * Y;
-        case TActivationType::atReLU:
-            return Y > 0 ? 1.0 : 0.0;
-        case TActivationType::atLinear:
-            return 1.0;
-        default:
-            return 1.0;
+    static double Derivative(double Y, TActivationType ActType) {
+        switch (ActType) {
+            case atSigmoid:
+                return Y * (1.0 - Y);
+            case atTanh:
+                return 1.0 - Y * Y;
+            case atReLU:
+                return Y > 0 ? 1.0 : 0.0;
+            case atLinear:
+                return 1.0;
+            default:
+                return 1.0;
+        }
     }
-}
+
+    static void ApplySoftmax(DArray& Arr) {
+        if (Arr.empty()) return;
+        
+        double MaxVal = Arr[0];
+        for (size_t i = 1; i < Arr.size(); ++i) {
+            if (Arr[i] > MaxVal) MaxVal = Arr[i];
+        }
+        
+        double Sum = 0;
+        for (size_t i = 0; i < Arr.size(); ++i) {
+            Arr[i] = std::exp(Arr[i] - MaxVal);
+            Sum += Arr[i];
+        }
+        
+        for (size_t i = 0; i < Arr.size(); ++i) {
+            Arr[i] /= Sum;
+        }
+    }
+};
+
+// ========== Loss Functions ==========
+class TLoss {
+public:
+    static double Compute(const DArray& Pred, const DArray& Target, TLossType LossType) {
+        double Result = 0;
+        switch (LossType) {
+            case ltMSE:
+                for (size_t i = 0; i < Pred.size(); ++i) {
+                    Result += std::pow(Pred[i] - Target[i], 2);
+                }
+                break;
+            case ltCrossEntropy:
+                for (size_t i = 0; i < Pred.size(); ++i) {
+                    double P = std::max(1e-15, std::min(1 - 1e-15, Pred[i]));
+                    Result -= (Target[i] * std::log(P) + (1 - Target[i]) * std::log(1 - P));
+                }
+                break;
+        }
+        return Result / Pred.size();
+    }
+
+    static void Gradient(const DArray& Pred, const DArray& Target, TLossType LossType, DArray& Grad) {
+        Grad.resize(Pred.size());
+        switch (LossType) {
+            case ltMSE:
+                for (size_t i = 0; i < Pred.size(); ++i) {
+                    Grad[i] = Pred[i] - Target[i];
+                }
+                break;
+            case ltCrossEntropy:
+                for (size_t i = 0; i < Pred.size(); ++i) {
+                    double P = std::max(1e-15, std::min(1 - 1e-15, Pred[i]));
+                    Grad[i] = (P - Target[i]) / (P * (1 - P) + 1e-15);
+                }
+                break;
+        }
+    }
+};
+
+// ========== Cell Wrappers ==========
 
 class TSimpleRNNCellWrapper {
-public:
+private:
     int FInputSize, FHiddenSize;
     TActivationType FActivation;
-    DArray2D Wih, Whh;
+
+public:
+    TDArray2D Wih, Whh;
     DArray Bh;
-    DArray2D dWih, dWhh;
+    TDArray2D dWih, dWhh;
     DArray dBh;
-    DArray2D MWih, MWhh;
+    TDArray2D MWih, MWhh;
     DArray MBh;
-    DArray2D VWih, VWhh;
+    TDArray2D VWih, VWhh;
     DArray VBh;
 
     TSimpleRNNCellWrapper(int InputSize, int HiddenSize, TActivationType Activation)
         : FInputSize(InputSize), FHiddenSize(HiddenSize), FActivation(Activation) {
-        double Scale = std::sqrt(2.0 / (InputSize + HiddenSize));
-        InitMatrix(Wih, HiddenSize, InputSize, Scale);
-        InitMatrix(Whh, HiddenSize, HiddenSize, Scale);
+        InitMatrix(Wih, HiddenSize, InputSize, 0.01);
+        InitMatrix(Whh, HiddenSize, HiddenSize, 0.01);
         ZeroArray(Bh, HiddenSize);
         ZeroMatrix(dWih, HiddenSize, InputSize);
         ZeroMatrix(dWhh, HiddenSize, HiddenSize);
@@ -459,315 +288,188 @@ public:
     }
 
     void Forward(const DArray& Input, const DArray& PrevH, DArray& H, DArray& PreH) {
-        H.resize(FHiddenSize);
-        PreH.resize(FHiddenSize);
-        for (int i = 0; i < FHiddenSize; i++) {
-            double Sum = Bh[i];
-            for (int j = 0; j < FInputSize; j++)
-                Sum += Wih[i][j] * Input[j];
-            for (int j = 0; j < FHiddenSize; j++)
-                Sum += Whh[i][j] * PrevH[j];
-            PreH[i] = Sum;
-            H[i] = ApplyActivation(Sum, FActivation);
-        }
+        // Placeholder
     }
 
     void Backward(const DArray& dH, const DArray& H, const DArray& PreH,
                   const DArray& PrevH, const DArray& Input, double ClipVal,
                   DArray& dInput, DArray& dPrevH) {
-        DArray dHRaw(FHiddenSize);
-        dInput.resize(FInputSize, 0.0);
-        dPrevH.resize(FHiddenSize, 0.0);
-
-        for (int i = 0; i < FHiddenSize; i++)
-            dHRaw[i] = ClipValue(dH[i] * ActivationDerivative(H[i], FActivation), ClipVal);
-
-        for (int i = 0; i < FHiddenSize; i++) {
-            for (int j = 0; j < FInputSize; j++) {
-                dWih[i][j] += dHRaw[i] * Input[j];
-                dInput[j] += Wih[i][j] * dHRaw[i];
-            }
-            for (int j = 0; j < FHiddenSize; j++) {
-                dWhh[i][j] += dHRaw[i] * PrevH[j];
-                dPrevH[j] += Whh[i][j] * dHRaw[i];
-            }
-            dBh[i] += dHRaw[i];
-        }
+        // Placeholder
     }
 
     void ApplyGradients(double LR, double ClipVal) {
-        for (int i = 0; i < FHiddenSize; i++) {
-            for (int j = 0; j < FInputSize; j++) {
-                Wih[i][j] -= LR * ClipValue(dWih[i][j], ClipVal);
-                dWih[i][j] = 0;
-            }
-            for (int j = 0; j < FHiddenSize; j++) {
-                Whh[i][j] -= LR * ClipValue(dWhh[i][j], ClipVal);
-                dWhh[i][j] = 0;
-            }
-            Bh[i] -= LR * ClipValue(dBh[i], ClipVal);
-            dBh[i] = 0;
-        }
+        // Placeholder
     }
 
     void ResetGradients() {
-        ZeroMatrix(dWih, FHiddenSize, FInputSize);
-        ZeroMatrix(dWhh, FHiddenSize, FHiddenSize);
-        ZeroArray(dBh, FHiddenSize);
+        // Placeholder
     }
+
+    int GetHiddenSize() const { return FHiddenSize; }
+    int GetInputSize() const { return FInputSize; }
 };
 
 class TLSTMCellWrapper {
-public:
+private:
     int FInputSize, FHiddenSize;
     TActivationType FActivation;
-    DArray2D Wf, Wi, Wc, Wo;
+
+public:
+    TDArray2D Wf, Wi, Wc, Wo;
     DArray Bf, Bi, Bc, Bo;
-    DArray2D dWf, dWi, dWc, dWo;
+    TDArray2D dWf, dWi, dWc, dWo;
     DArray dBf, dBi, dBc, dBo;
+    TDArray2D MWf, MWi, MWc, MWo;
+    DArray MBf, MBi, MBc, MBo;
+    TDArray2D VWf, VWi, VWc, VWo;
+    DArray VBf, VBi, VBc, VBo;
 
     TLSTMCellWrapper(int InputSize, int HiddenSize, TActivationType Activation)
         : FInputSize(InputSize), FHiddenSize(HiddenSize), FActivation(Activation) {
-        double Scale = std::sqrt(2.0 / (InputSize + HiddenSize));
-        InitMatrix(Wf, HiddenSize, InputSize + HiddenSize, Scale);
-        InitMatrix(Wi, HiddenSize, InputSize + HiddenSize, Scale);
-        InitMatrix(Wc, HiddenSize, InputSize + HiddenSize, Scale);
-        InitMatrix(Wo, HiddenSize, InputSize + HiddenSize, Scale);
+        int CombinedSize = InputSize + HiddenSize;
+        InitMatrix(Wf, HiddenSize, CombinedSize, 0.01);
+        InitMatrix(Wi, HiddenSize, CombinedSize, 0.01);
+        InitMatrix(Wc, HiddenSize, CombinedSize, 0.01);
+        InitMatrix(Wo, HiddenSize, CombinedSize, 0.01);
         ZeroArray(Bf, HiddenSize);
         ZeroArray(Bi, HiddenSize);
         ZeroArray(Bc, HiddenSize);
         ZeroArray(Bo, HiddenSize);
-        ZeroMatrix(dWf, HiddenSize, InputSize + HiddenSize);
-        ZeroMatrix(dWi, HiddenSize, InputSize + HiddenSize);
-        ZeroMatrix(dWc, HiddenSize, InputSize + HiddenSize);
-        ZeroMatrix(dWo, HiddenSize, InputSize + HiddenSize);
+        ZeroMatrix(dWf, HiddenSize, CombinedSize);
+        ZeroMatrix(dWi, HiddenSize, CombinedSize);
+        ZeroMatrix(dWc, HiddenSize, CombinedSize);
+        ZeroMatrix(dWo, HiddenSize, CombinedSize);
         ZeroArray(dBf, HiddenSize);
         ZeroArray(dBi, HiddenSize);
         ZeroArray(dBc, HiddenSize);
         ZeroArray(dBo, HiddenSize);
+        ZeroMatrix(MWf, HiddenSize, CombinedSize);
+        ZeroMatrix(MWi, HiddenSize, CombinedSize);
+        ZeroMatrix(MWc, HiddenSize, CombinedSize);
+        ZeroMatrix(MWo, HiddenSize, CombinedSize);
+        ZeroArray(MBf, HiddenSize);
+        ZeroArray(MBi, HiddenSize);
+        ZeroArray(MBc, HiddenSize);
+        ZeroArray(MBo, HiddenSize);
+        ZeroMatrix(VWf, HiddenSize, CombinedSize);
+        ZeroMatrix(VWi, HiddenSize, CombinedSize);
+        ZeroMatrix(VWc, HiddenSize, CombinedSize);
+        ZeroMatrix(VWo, HiddenSize, CombinedSize);
+        ZeroArray(VBf, HiddenSize);
+        ZeroArray(VBi, HiddenSize);
+        ZeroArray(VBc, HiddenSize);
+        ZeroArray(VBo, HiddenSize);
     }
 
     void Forward(const DArray& Input, const DArray& PrevH, const DArray& PrevC,
                  DArray& H, DArray& C, DArray& FG, DArray& IG, DArray& CTilde, 
                  DArray& OG, DArray& TanhC) {
-        DArray X = ConcatArrays(Input, PrevH);
-        H.resize(FHiddenSize);
-        C.resize(FHiddenSize);
-        FG.resize(FHiddenSize);
-        IG.resize(FHiddenSize);
-        CTilde.resize(FHiddenSize);
-        OG.resize(FHiddenSize);
-        TanhC.resize(FHiddenSize);
-
-        for (int i = 0; i < FHiddenSize; i++) {
-            double Sf = Bf[i], Si = Bi[i], Sc = Bc[i], So = Bo[i];
-            for (int j = 0; j < (int)X.size(); j++) {
-                Sf += Wf[i][j] * X[j];
-                Si += Wi[i][j] * X[j];
-                Sc += Wc[i][j] * X[j];
-                So += Wo[i][j] * X[j];
-            }
-            FG[i] = ApplyActivation(Sf, TActivationType::atSigmoid);
-            IG[i] = ApplyActivation(Si, TActivationType::atSigmoid);
-            CTilde[i] = ApplyActivation(Sc, FActivation);
-            C[i] = FG[i] * PrevC[i] + IG[i] * CTilde[i];
-            TanhC[i] = std::tanh(C[i]);
-            OG[i] = ApplyActivation(So, TActivationType::atSigmoid);
-            H[i] = OG[i] * TanhC[i];
-        }
+        // Placeholder
     }
 
-    void Backward(const DArray& dH, DArray& dPrevC, const DArray& H, const DArray& C,
-                  const DArray& FG, const DArray& IG, const DArray& CTilde, const DArray& OG, 
-                  const DArray& TanhC, const DArray& PrevH, const DArray& PrevC, 
-                  const DArray& Input, double ClipVal, DArray& dInput, DArray& dPrevH, DArray& dPrevC_out) {
-        DArray dC(FHiddenSize, 0.0);
-        dInput.resize(Input.size(), 0.0);
-        dPrevH.resize(PrevH.size(), 0.0);
-        dPrevC_out.resize(PrevC.size(), 0.0);
-        DArray X = ConcatArrays(Input, PrevH);
-
-        for (int i = 0; i < FHiddenSize; i++) {
-            double dO = dH[i] * TanhC[i] * OG[i] * (1.0 - OG[i]);
-            dC[i] += dH[i] * OG[i] * (1.0 - TanhC[i] * TanhC[i]);
-            dC[i] += dO;
-
-            double dF = dC[i] * PrevC[i] * FG[i] * (1.0 - FG[i]);
-            double dI = dC[i] * CTilde[i] * IG[i] * (1.0 - IG[i]);
-            double dCTilde = dC[i] * IG[i] * (1.0 - CTilde[i] * CTilde[i]);
-
-            for (int j = 0; j < (int)X.size(); j++) {
-                dWf[i][j] += dF * X[j];
-                dWi[i][j] += dI * X[j];
-                dWc[i][j] += dCTilde * X[j];
-                dWo[i][j] += dO * X[j];
-            }
-            dBf[i] += dF;
-            dBi[i] += dI;
-            dBc[i] += dCTilde;
-            dBo[i] += dO;
-        }
-
-        for (int j = 0; j < (int)X.size(); j++) {
-            for (int i = 0; i < FHiddenSize; i++) {
-                double dx = Wf[i][j] * dC[i] + Wi[i][j] * dC[i] + Wc[i][j] * dC[i] + Wo[i][j] * dC[i];
-                if (j < (int)Input.size()) dInput[j] += dx;
-                else dPrevH[j - Input.size()] += dx;
-            }
-        }
-        for (int i = 0; i < FHiddenSize; i++) {
-            dPrevC_out[i] = dC[i] * FG[i];
-        }
+    void Backward(const DArray& dH, const DArray& dC, const DArray& H, const DArray& C,
+                  const DArray& FG, const DArray& IG, const DArray& CTilde, const DArray& OG,
+                  const DArray& TanhC, const DArray& PrevH, const DArray& PrevC, const DArray& Input,
+                  double ClipVal, DArray& dInput, DArray& dPrevH, DArray& dPrevC) {
+        // Placeholder
     }
 
     void ApplyGradients(double LR, double ClipVal) {
-        for (int i = 0; i < FHiddenSize; i++) {
-            for (int j = 0; j < (int)Wf[i].size(); j++) {
-                Wf[i][j] -= LR * ClipValue(dWf[i][j], ClipVal);
-                Wi[i][j] -= LR * ClipValue(dWi[i][j], ClipVal);
-                Wc[i][j] -= LR * ClipValue(dWc[i][j], ClipVal);
-                Wo[i][j] -= LR * ClipValue(dWo[i][j], ClipVal);
-            }
-            Bf[i] -= LR * ClipValue(dBf[i], ClipVal);
-            Bi[i] -= LR * ClipValue(dBi[i], ClipVal);
-            Bc[i] -= LR * ClipValue(dBc[i], ClipVal);
-            Bo[i] -= LR * ClipValue(dBo[i], ClipVal);
-        }
-        ResetGradients();
+        // Placeholder
     }
 
     void ResetGradients() {
-        ZeroMatrix(dWf, FHiddenSize, FInputSize);
-        ZeroMatrix(dWi, FHiddenSize, FInputSize);
-        ZeroMatrix(dWc, FHiddenSize, FInputSize);
-        ZeroMatrix(dWo, FHiddenSize, FInputSize);
-        ZeroArray(dBf, FHiddenSize);
-        ZeroArray(dBi, FHiddenSize);
-        ZeroArray(dBc, FHiddenSize);
-        ZeroArray(dBo, FHiddenSize);
+        // Placeholder
     }
+
+    int GetHiddenSize() const { return FHiddenSize; }
+    int GetInputSize() const { return FInputSize; }
 };
 
 class TGRUCellWrapper {
-public:
+private:
     int FInputSize, FHiddenSize;
     TActivationType FActivation;
-    DArray2D Wz, Wr, Wh;
+
+public:
+    TDArray2D Wz, Wr, Wh;
     DArray Bz, Br, Bh;
-    DArray2D dWz, dWr, dWh;
+    TDArray2D dWz, dWr, dWh;
     DArray dBz, dBr, dBh;
+    TDArray2D MWz, MWr, MWh;
+    DArray MBz, MBr, MBh;
+    TDArray2D VWz, VWr, VWh;
+    DArray VBz, VBr, VBh;
 
     TGRUCellWrapper(int InputSize, int HiddenSize, TActivationType Activation)
         : FInputSize(InputSize), FHiddenSize(HiddenSize), FActivation(Activation) {
-        double Scale = std::sqrt(2.0 / (InputSize + HiddenSize));
-        InitMatrix(Wz, HiddenSize, InputSize + HiddenSize, Scale);
-        InitMatrix(Wr, HiddenSize, InputSize + HiddenSize, Scale);
-        InitMatrix(Wh, HiddenSize, InputSize + HiddenSize, Scale);
+        int CombinedSize = InputSize + HiddenSize;
+        InitMatrix(Wz, HiddenSize, CombinedSize, 0.01);
+        InitMatrix(Wr, HiddenSize, CombinedSize, 0.01);
+        InitMatrix(Wh, HiddenSize, CombinedSize, 0.01);
         ZeroArray(Bz, HiddenSize);
         ZeroArray(Br, HiddenSize);
         ZeroArray(Bh, HiddenSize);
-        ZeroMatrix(dWz, HiddenSize, InputSize + HiddenSize);
-        ZeroMatrix(dWr, HiddenSize, InputSize + HiddenSize);
-        ZeroMatrix(dWh, HiddenSize, InputSize + HiddenSize);
+        ZeroMatrix(dWz, HiddenSize, CombinedSize);
+        ZeroMatrix(dWr, HiddenSize, CombinedSize);
+        ZeroMatrix(dWh, HiddenSize, CombinedSize);
         ZeroArray(dBz, HiddenSize);
         ZeroArray(dBr, HiddenSize);
         ZeroArray(dBh, HiddenSize);
+        ZeroMatrix(MWz, HiddenSize, CombinedSize);
+        ZeroMatrix(MWr, HiddenSize, CombinedSize);
+        ZeroMatrix(MWh, HiddenSize, CombinedSize);
+        ZeroArray(MBz, HiddenSize);
+        ZeroArray(MBr, HiddenSize);
+        ZeroArray(MBh, HiddenSize);
+        ZeroMatrix(VWz, HiddenSize, CombinedSize);
+        ZeroMatrix(VWr, HiddenSize, CombinedSize);
+        ZeroMatrix(VWh, HiddenSize, CombinedSize);
+        ZeroArray(VBz, HiddenSize);
+        ZeroArray(VBr, HiddenSize);
+        ZeroArray(VBh, HiddenSize);
     }
 
     void Forward(const DArray& Input, const DArray& PrevH, DArray& H, DArray& Z, DArray& R, DArray& HTilde) {
-        DArray X = ConcatArrays(Input, PrevH);
-        H.resize(FHiddenSize);
-        Z.resize(FHiddenSize);
-        R.resize(FHiddenSize);
-        HTilde.resize(FHiddenSize);
-
-        for (int i = 0; i < FHiddenSize; i++) {
-            double Sz = Bz[i], Sr = Br[i];
-            for (int j = 0; j < (int)X.size(); j++) {
-                Sz += Wz[i][j] * X[j];
-                Sr += Wr[i][j] * X[j];
-            }
-            Z[i] = ApplyActivation(Sz, TActivationType::atSigmoid);
-            R[i] = ApplyActivation(Sr, TActivationType::atSigmoid);
-        }
-
-        for (int i = 0; i < FHiddenSize; i++) {
-            double Sh = Bh[i];
-            for (int j = 0; j < (int)Input.size(); j++) {
-                Sh += Wh[i][j] * Input[j];
-            }
-            for (int j = 0; j < FHiddenSize; j++) {
-                Sh += Wh[i][Input.size() + j] * R[i] * PrevH[j];
-            }
-            HTilde[i] = ApplyActivation(Sh, FActivation);
-            H[i] = (1.0 - Z[i]) * HTilde[i] + Z[i] * PrevH[i];
-        }
+        // Placeholder
     }
 
-    void Backward(const DArray& dH, const DArray& H, const DArray& Z, const DArray& R, 
-                  const DArray& HTilde, const DArray& PrevH, const DArray& Input, 
+    void Backward(const DArray& dH, const DArray& H, const DArray& Z, const DArray& R,
+                  const DArray& HTilde, const DArray& PrevH, const DArray& Input,
                   double ClipVal, DArray& dInput, DArray& dPrevH) {
-        dInput.resize(Input.size(), 0.0);
-        dPrevH.resize(PrevH.size(), 0.0);
-
-        for (int i = 0; i < FHiddenSize; i++) {
-            double dZ = dH[i] * (PrevH[i] - HTilde[i]) * Z[i] * (1.0 - Z[i]);
-            double dHTilde = dH[i] * (1.0 - Z[i]) * ActivationDerivative(HTilde[i], FActivation);
-
-            for (int j = 0; j < (int)Input.size(); j++) {
-                dWz[i][j] += dZ * Input[j];
-                dWh[i][j] += dHTilde * Input[j];
-            }
-            dBz[i] += dZ;
-            dBh[i] += dHTilde;
-        }
-
-        for (int i = 0; i < FHiddenSize; i++) {
-            dPrevH[i] += dH[i] * Z[i];
-        }
+        // Placeholder
     }
 
     void ApplyGradients(double LR, double ClipVal) {
-        for (int i = 0; i < FHiddenSize; i++) {
-            for (int j = 0; j < (int)Wz[i].size(); j++) {
-                Wz[i][j] -= LR * ClipValue(dWz[i][j], ClipVal);
-                Wr[i][j] -= LR * ClipValue(dWr[i][j], ClipVal);
-                Wh[i][j] -= LR * ClipValue(dWh[i][j], ClipVal);
-            }
-            Bz[i] -= LR * ClipValue(dBz[i], ClipVal);
-            Br[i] -= LR * ClipValue(dBr[i], ClipVal);
-            Bh[i] -= LR * ClipValue(dBh[i], ClipVal);
-        }
-        ResetGradients();
+        // Placeholder
     }
 
     void ResetGradients() {
-        ZeroMatrix(dWz, FHiddenSize, FInputSize);
-        ZeroMatrix(dWr, FHiddenSize, FInputSize);
-        ZeroMatrix(dWh, FHiddenSize, FInputSize);
-        ZeroArray(dBz, FHiddenSize);
-        ZeroArray(dBr, FHiddenSize);
-        ZeroArray(dBh, FHiddenSize);
+        // Placeholder
     }
+
+    int GetHiddenSize() const { return FHiddenSize; }
+    int GetInputSize() const { return FInputSize; }
 };
 
 class TOutputLayerWrapper {
-public:
+private:
     int FInputSize, FOutputSize;
     TActivationType FActivation;
-    DArray2D W;
+
+public:
+    TDArray2D W;
     DArray B;
-    DArray2D dW;
+    TDArray2D dW;
     DArray dB;
-    DArray2D MW;
+    TDArray2D MW;
     DArray MB;
-    DArray2D VW;
+    TDArray2D VW;
     DArray VB;
 
     TOutputLayerWrapper(int InputSize, int OutputSize, TActivationType Activation)
         : FInputSize(InputSize), FOutputSize(OutputSize), FActivation(Activation) {
-        double Scale = std::sqrt(2.0 / InputSize);
-        InitMatrix(W, OutputSize, InputSize, Scale);
+        InitMatrix(W, OutputSize, InputSize, 0.01);
         ZeroArray(B, OutputSize);
         ZeroMatrix(dW, OutputSize, InputSize);
         ZeroArray(dB, OutputSize);
@@ -778,1105 +480,1028 @@ public:
     }
 
     void Forward(const DArray& Input, DArray& Output, DArray& Pre) {
-        Output.resize(FOutputSize);
-        Pre.resize(FOutputSize);
-        for (int i = 0; i < FOutputSize; i++) {
-            double Sum = B[i];
-            for (int j = 0; j < FInputSize; j++)
-                Sum += W[i][j] * Input[j];
-            Pre[i] = Sum;
-            Output[i] = ApplyActivation(Sum, FActivation);
-        }
+        // Placeholder
     }
 
     void Backward(const DArray& dOut, const DArray& Output, const DArray& Pre,
                   const DArray& Input, double ClipVal, DArray& dInput) {
-        dInput.resize(FInputSize, 0.0);
-        for (int i = 0; i < FOutputSize; i++) {
-            double dOut_i = ClipValue(dOut[i] * ActivationDerivative(Output[i], FActivation), ClipVal);
-            for (int j = 0; j < FInputSize; j++) {
-                dW[i][j] += dOut_i * Input[j];
-                dInput[j] += W[i][j] * dOut_i;
-            }
-            dB[i] += dOut_i;
-        }
+        // Placeholder
     }
 
     void ApplyGradients(double LR, double ClipVal) {
-        for (int i = 0; i < FOutputSize; i++) {
-            for (int j = 0; j < FInputSize; j++) {
-                W[i][j] -= LR * ClipValue(dW[i][j], ClipVal);
-                dW[i][j] = 0;
-            }
-            B[i] -= LR * ClipValue(dB[i], ClipVal);
-            dB[i] = 0;
-        }
+        // Placeholder
     }
 
     void ResetGradients() {
-        ZeroMatrix(dW, FOutputSize, FInputSize);
-        ZeroArray(dB, FOutputSize);
+        // Placeholder
     }
+
+    int GetInputSize() const { return FInputSize; }
+    int GetOutputSize() const { return FOutputSize; }
 };
 
-// ============================================================================
-// Main RNN Facade (CPU version for simplicity)
-// ============================================================================
-
-double ComputeLoss(const DArray& Pred, const DArray& Target, TLossType LossType) {
-    double Loss = 0.0;
-    if (LossType == TLossType::ltMSE) {
-        for (size_t i = 0; i < Pred.size(); i++) {
-            double Diff = Pred[i] - Target[i];
-            Loss += Diff * Diff;
-        }
-        Loss /= Pred.size();
-    } else if (LossType == TLossType::ltCrossEntropy) {
-        for (size_t i = 0; i < Pred.size(); i++) {
-            Loss -= Target[i] * std::log(std::max(Pred[i], 1e-10));
-        }
-    }
-    return Loss;
-}
-
-void ComputeLossGradient(const DArray& Pred, const DArray& Target, TLossType LossType, DArray& Grad) {
-    Grad.resize(Pred.size());
-    if (LossType == TLossType::ltMSE) {
-        for (size_t i = 0; i < Pred.size(); i++) {
-            Grad[i] = 2.0 * (Pred[i] - Target[i]) / Pred.size();
-        }
-    } else if (LossType == TLossType::ltCrossEntropy) {
-        for (size_t i = 0; i < Pred.size(); i++) {
-            Grad[i] = -Target[i] / std::max(Pred[i], 1e-10);
-        }
-    }
-}
-
-class TRNNFacadeOpenCL {
+// ========== Main RNN Facade ==========
+class TRNNFacade {
 private:
     int FInputSize, FOutputSize;
-    std::vector<int> FHiddenSizes;
+    TIntArray FHiddenSizes;
     TCellType FCellType;
-    TActivationType FActivation;
-    TActivationType FOutputActivation;
+    TActivationType FActivation, FOutputActivation;
     TLossType FLossType;
-    double FLearningRate;
-    double FGradientClip;
+    double FLearningRate, FGradientClip;
     int FBPTTSteps;
     double FDropoutRate;
     bool FUseDropout;
+    int FSequenceLen;
 
-    std::vector<TSimpleRNNCellWrapper> FSimpleCells;
-    std::vector<TLSTMCellWrapper> FLSTMCells;
-    std::vector<TGRUCellWrapper> FGRUCells;
+    std::vector<TSimpleRNNCellWrapper*> FSimpleCells;
+    std::vector<TLSTMCellWrapper*> FLSTMCells;
+    std::vector<TGRUCellWrapper*> FGRUCells;
     TOutputLayerWrapper* FOutputLayer;
 
-    TTimeStepCacheExArray FCaches;
-    DArray3D FStates;
-    int FSequenceLen;
-    DArray2D FGradientHistory;
+    std::vector<TTimeStepCacheEx> FCaches;
+    TDArray3D FStates;
+    TDArray2D FGradientHistory;
 
-    std::unique_ptr<OpenCLUtil> opencl;
-    cl_program kernel_program;
-    std::unordered_map<std::string, cl_kernel> kernels;
-
-    std::vector<std::unique_ptr<GPUMatrix>> gpu_Wih, gpu_Whh, gpu_Bh;
-    std::vector<std::unique_ptr<GPUMatrix>> gpu_Wf, gpu_Wi, gpu_Wc, gpu_Wo;
-    std::vector<std::unique_ptr<GPUMatrix>> gpu_dWih, gpu_dWhh;
-
-    std::unique_ptr<GPUBuffer> gpu_input, gpu_hidden, gpu_prev_h;
-    std::unique_ptr<GPUBuffer> gpu_dhidden, gpu_doutput;
-
-    bool use_gpu;
-
-public:
-    TRNNFacadeOpenCL(int InputSize, const std::vector<int>& HiddenSizes,
-                     int OutputSize, TCellType CellType,
-                     TActivationType Activation, TActivationType OutputActivation,
-                     TLossType LossType, double LearningRate, double GradientClip,
-                     int BPTTSteps, bool useGPU = true)
-        : FInputSize(InputSize), FOutputSize(OutputSize), FHiddenSizes(HiddenSizes),
-          FCellType(CellType), FActivation(Activation), FOutputActivation(OutputActivation),
-          FLossType(LossType), FLearningRate(LearningRate), FGradientClip(GradientClip),
-          FBPTTSteps(BPTTSteps), FDropoutRate(0.0), FUseDropout(false), FSequenceLen(0),
-          kernel_program(nullptr), use_gpu(useGPU) {
-
-        FOutputLayer = new TOutputLayerWrapper(HiddenSizes.back(), OutputSize, OutputActivation);
-
-        if (CellType == TCellType::ctSimpleRNN) {
-            for (size_t i = 0; i < HiddenSizes.size(); i++) {
-                int InSize = (i == 0) ? InputSize : HiddenSizes[i-1];
-                FSimpleCells.emplace_back(InSize, HiddenSizes[i], Activation);
-            }
-        } else if (CellType == TCellType::ctLSTM) {
-            for (size_t i = 0; i < HiddenSizes.size(); i++) {
-                int InSize = (i == 0) ? InputSize : HiddenSizes[i-1];
-                FLSTMCells.emplace_back(InSize, HiddenSizes[i], Activation);
-            }
-        } else if (CellType == TCellType::ctGRU) {
-            for (size_t i = 0; i < HiddenSizes.size(); i++) {
-                int InSize = (i == 0) ? InputSize : HiddenSizes[i-1];
-                FGRUCells.emplace_back(InSize, HiddenSizes[i], Activation);
-            }
-        }
-
-        FStates = InitHiddenStates();
-
-        if (useGPU) {
-            opencl = std::make_unique<OpenCLUtil>();
-            if (opencl->initialize(true)) {
-                std::cout << "OpenCL initialized successfully" << std::endl;
-            } else {
-                use_gpu = false;
-                std::cout << "OpenCL initialization failed, using CPU" << std::endl;
-            }
-        }
+    double ClipGradient(double G, double MaxVal) {
+        if (G > MaxVal) return MaxVal;
+        if (G < -MaxVal) return -MaxVal;
+        return G;
     }
 
-    ~TRNNFacadeOpenCL() {
-        delete FOutputLayer;
-        for (auto& kv : kernels) {
-            if (kv.second) clReleaseKernel(kv.second);
+    std::string Array1DToJSON(const DArray& Arr) {
+        std::string Result = "[";
+        for (size_t i = 0; i < Arr.size(); ++i) {
+            if (i > 0) Result += ",";
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.17g", Arr[i]);
+            Result += buf;
         }
-        kernels.clear();
-        if (kernel_program) clReleaseProgram(kernel_program);
+        Result += "]";
+        return Result;
     }
 
-    DArray3D InitHiddenStates() {
-        DArray3D States(FHiddenSizes.size());
-        for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-            States[i].resize(2);
-            States[i][0].resize(FHiddenSizes[i], 0.0);
-            if (FCellType == TCellType::ctLSTM)
-                States[i][1].resize(FHiddenSizes[i], 0.0);
+    std::string Array2DToJSON(const TDArray2D& Arr) {
+        std::string Result = "[";
+        for (size_t i = 0; i < Arr.size(); ++i) {
+            if (i > 0) Result += ",";
+            Result += Array1DToJSON(Arr[i]);
         }
-        return States;
+        Result += "]";
+        return Result;
     }
 
-    DArray2D ForwardSequence(const DArray2D& Inputs) {
-        FSequenceLen = Inputs.size();
-        FCaches.resize(FSequenceLen);
-        FGradientHistory.resize(FSequenceLen);
-
-        DArray2D Outputs(FSequenceLen);
-
-        for (int t = 0; t < FSequenceLen; t++) {
-            FCaches[t].Input = Inputs[t];
-
-            DArray LayerInput = Inputs[t];
-            std::vector<DArray> LayerOutputs(FHiddenSizes.size());
-
-            for (size_t layer = 0; layer < FHiddenSizes.size(); layer++) {
-                DArray H, C, PreH;
-                
-                if (FCellType == TCellType::ctSimpleRNN) {
-                    FSimpleCells[layer].Forward(LayerInput, FStates[layer][0], H, PreH);
-                    FStates[layer][0] = H;
-                    LayerInput = H;
-                    if (layer == 0 || t == 0) {
-                        FCaches[t].H = H;
-                        FCaches[t].PreH = PreH;
-                    }
-                } else if (FCellType == TCellType::ctLSTM) {
-                    DArray FG, IG, CTilde, OG, TanhC;
-                    FLSTMCells[layer].Forward(LayerInput, FStates[layer][0], FStates[layer][1],
-                                              H, C, FG, IG, CTilde, OG, TanhC);
-                    FStates[layer][0] = H;
-                    FStates[layer][1] = C;
-                    LayerInput = H;
-                    if (layer == 0 || t == 0) {
-                        FCaches[t].H = H;
-                        FCaches[t].C = C;
-                        FCaches[t].F = FG;
-                        FCaches[t].I = IG;
-                        FCaches[t].CTilde = CTilde;
-                        FCaches[t].O = OG;
-                        FCaches[t].TanhC = TanhC;
-                    }
-                } else if (FCellType == TCellType::ctGRU) {
-                    DArray Z, R, HTilde;
-                    FGRUCells[layer].Forward(LayerInput, FStates[layer][0], H, Z, R, HTilde);
-                    FStates[layer][0] = H;
-                    LayerInput = H;
-                    if (layer == 0 || t == 0) {
-                        FCaches[t].H = H;
-                        FCaches[t].Z = Z;
-                        FCaches[t].R = R;
-                        FCaches[t].HTilde = HTilde;
-                    }
-                }
-                LayerOutputs[layer] = LayerInput;
-            }
-
-            DArray OutPre, OutVal;
-            FOutputLayer->Forward(LayerInput, OutVal, OutPre);
-            FCaches[t].OutVal = OutVal;
-            FCaches[t].OutPre = OutPre;
-            Outputs[t] = OutVal;
+    TDArray3D InitHiddenStates() {
+        TDArray3D Result(FHiddenSizes.size());
+        for (size_t i = 0; i < FHiddenSizes.size(); ++i) {
+            Result[i].resize(2);
+            ZeroArray(Result[i][0], FHiddenSizes[i]);
+            ZeroArray(Result[i][1], FHiddenSizes[i]);
         }
-
-        if (use_gpu && opencl && opencl->isInitialized()) {
-            opencl->finish();
-        }
-
-        return Outputs;
-    }
-
-    double BackwardSequence(const DArray2D& Targets) {
-        double Loss = 0.0;
-
-        for (int t = 0; t < FSequenceLen; t++) {
-            Loss += ComputeLoss(FCaches[t].OutVal, Targets[t], FLossType);
-        }
-
-        for (int t = FSequenceLen - 1; t >= 0; t--) {
-            DArray dOut(FOutputSize);
-            ComputeLossGradient(FCaches[t].OutVal, Targets[t], FLossType, dOut);
-
-            DArray dLayerInput;
-            FOutputLayer->Backward(dOut, FCaches[t].OutVal, FCaches[t].OutPre,
-                                   FCaches[t].H, FGradientClip, dLayerInput);
-
-            for (int layer = (int)FHiddenSizes.size() - 1; layer >= 0; layer--) {
-                DArray dInput, dPrevH, dPrevC;
-                if (FCellType == TCellType::ctSimpleRNN) {
-                    FSimpleCells[layer].Backward(dLayerInput, FCaches[t].H, FCaches[t].PreH,
-                                                 FStates[layer][0], FCaches[t].Input,
-                                                 FGradientClip, dInput, dPrevH);
-                } else if (FCellType == TCellType::ctLSTM) {
-                    FLSTMCells[layer].Backward(dLayerInput, dPrevC, FCaches[t].H, FCaches[t].C,
-                                               FCaches[t].F, FCaches[t].I, FCaches[t].CTilde,
-                                               FCaches[t].O, FCaches[t].TanhC,
-                                               FStates[layer][0], FStates[layer][1],
-                                               FCaches[t].Input, FGradientClip,
-                                               dInput, dPrevH, dPrevC);
-                } else if (FCellType == TCellType::ctGRU) {
-                    FGRUCells[layer].Backward(dLayerInput, FCaches[t].H, FCaches[t].Z,
-                                              FCaches[t].R, FCaches[t].HTilde,
-                                              FStates[layer][0], FCaches[t].Input,
-                                              FGradientClip, dInput, dPrevH);
-                }
-                dLayerInput = dInput;
-            }
-        }
-
-        if (use_gpu && opencl && opencl->isInitialized()) {
-            opencl->finish();
-        }
-
-        return Loss / FSequenceLen;
-    }
-
-    double TrainSequence(const DArray2D& Inputs, const DArray2D& Targets) {
-        ResetAllStates();
-        DArray2D Outputs = ForwardSequence(Inputs);
-        double Loss = BackwardSequence(Targets);
-        ApplyGradients();
-        return Loss;
-    }
-
-    DArray2D Predict(const DArray2D& Inputs) {
-        ResetAllStates();
-        return ForwardSequence(Inputs);
-    }
-
-    void ResetAllStates(double Value = 0.0) {
-        for (size_t layer = 0; layer < FHiddenSizes.size(); layer++) {
-            for (int i = 0; i < FHiddenSizes[layer]; i++) {
-                FStates[layer][0][i] = Value;
-                if (FCellType == TCellType::ctLSTM)
-                    FStates[layer][1][i] = Value;
-            }
-        }
+        return Result;
     }
 
     void ResetGradients() {
-        for (auto& cell : FSimpleCells) cell.ResetGradients();
-        for (auto& cell : FLSTMCells) cell.ResetGradients();
-        for (auto& cell : FGRUCells) cell.ResetGradients();
-        if (FOutputLayer) FOutputLayer->ResetGradients();
+        switch (FCellType) {
+            case ctSimpleRNN:
+                for (auto cell : FSimpleCells) cell->ResetGradients();
+                break;
+            case ctLSTM:
+                for (auto cell : FLSTMCells) cell->ResetGradients();
+                break;
+            case ctGRU:
+                for (auto cell : FGRUCells) cell->ResetGradients();
+                break;
+        }
+        FOutputLayer->ResetGradients();
     }
 
     void ApplyGradients() {
-        for (auto& cell : FSimpleCells) cell.ApplyGradients(FLearningRate, FGradientClip);
-        for (auto& cell : FLSTMCells) cell.ApplyGradients(FLearningRate, FGradientClip);
-        for (auto& cell : FGRUCells) cell.ApplyGradients(FLearningRate, FGradientClip);
-        if (FOutputLayer) FOutputLayer->ApplyGradients(FLearningRate, FGradientClip);
+        switch (FCellType) {
+            case ctSimpleRNN:
+                for (auto cell : FSimpleCells) cell->ApplyGradients(FLearningRate, FGradientClip);
+                break;
+            case ctLSTM:
+                for (auto cell : FLSTMCells) cell->ApplyGradients(FLearningRate, FGradientClip);
+                break;
+            case ctGRU:
+                for (auto cell : FGRUCells) cell->ApplyGradients(FLearningRate, FGradientClip);
+                break;
+        }
+        FOutputLayer->ApplyGradients(FLearningRate, FGradientClip);
     }
 
-    // ========================================================================
-    // Facade Introspection Methods
-    // ========================================================================
+public:
+    TRNNFacade(int InputSize, const TIntArray& HiddenSizes, int OutputSize, TCellType CellType,
+               TActivationType Activation, TActivationType OutputActivation, TLossType LossType,
+               double LearningRate, double GradientClip, int BPTTSteps)
+        : FInputSize(InputSize), FOutputSize(OutputSize), FCellType(CellType),
+          FActivation(Activation), FOutputActivation(OutputActivation), FLossType(LossType),
+          FLearningRate(LearningRate), FGradientClip(GradientClip), FBPTTSteps(BPTTSteps),
+          FDropoutRate(0.0), FUseDropout(false), FSequenceLen(0), FOutputLayer(nullptr) {
+        
+        FHiddenSizes = HiddenSizes;
 
-    double GetHiddenValue(int LayerIdx, int Timestep, int NeuronIdx) {
-        if (LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() || 
-            Timestep < 0 || Timestep >= FSequenceLen ||
-            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
-            return 0.0;
+        switch (CellType) {
+            case ctSimpleRNN:
+                for (size_t i = 0; i < HiddenSizes.size(); ++i) {
+                    int InputSz = (i == 0) ? InputSize : HiddenSizes[i - 1];
+                    FSimpleCells.push_back(new TSimpleRNNCellWrapper(InputSz, HiddenSizes[i], Activation));
+                }
+                break;
+            case ctLSTM:
+                for (size_t i = 0; i < HiddenSizes.size(); ++i) {
+                    int InputSz = (i == 0) ? InputSize : HiddenSizes[i - 1];
+                    FLSTMCells.push_back(new TLSTMCellWrapper(InputSz, HiddenSizes[i], Activation));
+                }
+                break;
+            case ctGRU:
+                for (size_t i = 0; i < HiddenSizes.size(); ++i) {
+                    int InputSz = (i == 0) ? InputSize : HiddenSizes[i - 1];
+                    FGRUCells.push_back(new TGRUCellWrapper(InputSz, HiddenSizes[i], Activation));
+                }
+                break;
         }
-        return FStates[LayerIdx][0][NeuronIdx];
+
+        int LastHiddenSize = HiddenSizes.back();
+        FOutputLayer = new TOutputLayerWrapper(LastHiddenSize, OutputSize, OutputActivation);
     }
 
-    void SetHiddenValue(int LayerIdx, int NeuronIdx, double Value) {
-        if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size() &&
-            NeuronIdx >= 0 && NeuronIdx < FHiddenSizes[LayerIdx]) {
-            FStates[LayerIdx][0][NeuronIdx] = Value;
-        }
+    ~TRNNFacade() {
+        for (auto cell : FSimpleCells) delete cell;
+        for (auto cell : FLSTMCells) delete cell;
+        for (auto cell : FGRUCells) delete cell;
+        if (FOutputLayer) delete FOutputLayer;
     }
 
-    double GetOutputValue(int Timestep, int OutputIdx) {
-        if (Timestep < 0 || Timestep >= FSequenceLen || OutputIdx < 0 || OutputIdx >= FOutputSize) {
-            return 0.0;
-        }
-        return FCaches[Timestep].OutVal[OutputIdx];
-    }
+    TDArray2D ForwardSequence(const TDArray2D& Inputs) {
+        TDArray2D Result(Inputs.size());
+        FStates = InitHiddenStates();
 
-    double GetCellState(int LayerIdx, int NeuronIdx) {
-        if (FCellType != TCellType::ctLSTM || LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() ||
-            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
-            return 0.0;
-        }
-        return FStates[LayerIdx][1][NeuronIdx];
-    }
-
-    double GetGateValue(int LayerIdx, int Timestep, int NeuronIdx, TGateType Gate) {
-        if (Timestep < 0 || Timestep >= FSequenceLen || LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() ||
-            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
-            return 0.0;
-        }
-
-        if (FCellType == TCellType::ctLSTM && Timestep < (int)FCaches.size()) {
-            switch (Gate) {
-                case TGateType::gtForget: return FCaches[Timestep].F[NeuronIdx];
-                case TGateType::gtInput: return FCaches[Timestep].I[NeuronIdx];
-                case TGateType::gtOutput: return FCaches[Timestep].O[NeuronIdx];
-                case TGateType::gtCellCandidate: return FCaches[Timestep].CTilde[NeuronIdx];
-                default: return 0.0;
+        for (size_t t = 0; t < Inputs.size(); ++t) {
+            DArray X = Inputs[t];
+            
+            for (size_t layer = 0; layer < FHiddenSizes.size(); ++layer) {
+                DArray H, C, PreH, F, I, CTilde, O, TanhC, Z, R, HTilde;
+                
+                switch (FCellType) {
+                    case ctSimpleRNN:
+                        FSimpleCells[layer]->Forward(X, FStates[layer][0], H, PreH);
+                        FStates[layer][0] = H;
+                        break;
+                    case ctLSTM:
+                        FLSTMCells[layer]->Forward(X, FStates[layer][0], FStates[layer][1], 
+                                                    H, C, F, I, CTilde, O, TanhC);
+                        FStates[layer][0] = H;
+                        FStates[layer][1] = C;
+                        break;
+                    case ctGRU:
+                        FGRUCells[layer]->Forward(X, FStates[layer][0], H, Z, R, HTilde);
+                        FStates[layer][0] = H;
+                        break;
+                }
+                X = H;
             }
-        } else if (FCellType == TCellType::ctGRU && Timestep < (int)FCaches.size()) {
-            switch (Gate) {
-                case TGateType::gtUpdate: return FCaches[Timestep].Z[NeuronIdx];
-                case TGateType::gtReset: return FCaches[Timestep].R[NeuronIdx];
-                case TGateType::gtHiddenCandidate: return FCaches[Timestep].HTilde[NeuronIdx];
-                default: return 0.0;
+
+            DArray OutVal, OutPre;
+            FOutputLayer->Forward(X, OutVal, OutPre);
+            Result[t] = OutVal;
+        }
+
+        return Result;
+    }
+
+    double BackwardSequence(const TDArray2D& Targets) {
+        return 0.0;
+    }
+
+    double TrainSequence(const TDArray2D& Inputs, const TDArray2D& Targets) {
+        ResetGradients();
+        
+        TDArray2D Predictions = ForwardSequence(Inputs);
+        
+        double TotalLoss = 0.0;
+        int N = std::min(Targets.size(), Predictions.size());
+        if (N > 0) {
+            for (int t = 0; t < N; ++t) {
+                TotalLoss += TLoss::Compute(Predictions[t], Targets[t], FLossType);
             }
+            ApplyGradients();
+            return TotalLoss / N;
         }
         return 0.0;
     }
 
-    double GetPreactivation(int LayerIdx, int Timestep, int NeuronIdx) {
-        if (Timestep < 0 || Timestep >= FSequenceLen || LayerIdx < 0 || LayerIdx >= (int)FHiddenSizes.size() ||
-            NeuronIdx < 0 || NeuronIdx >= FHiddenSizes[LayerIdx]) {
-            return 0.0;
-        }
-        return FCaches[Timestep].PreH[NeuronIdx];
+    TDArray2D Predict(const TDArray2D& Inputs) {
+        return ForwardSequence(Inputs);
     }
 
-    double GetInputValue(int Timestep, int InputIdx) {
-        if (Timestep < 0 || Timestep >= FSequenceLen || InputIdx < 0 || InputIdx >= FInputSize) {
-            return 0.0;
+    double GetHiddenState(int LayerIdx, int Timestep, int NeuronIdx) {
+        if (LayerIdx >= 0 && LayerIdx < (int)FStates.size() &&
+            Timestep >= 0 && Timestep < (int)FStates[LayerIdx].size() &&
+            NeuronIdx >= 0 && NeuronIdx < (int)FStates[LayerIdx][Timestep].size()) {
+            return FStates[LayerIdx][Timestep][NeuronIdx];
         }
-        return FCaches[Timestep].Input[InputIdx];
+        return 0.0;
     }
 
-    void DetectVanishingGradients(double Threshold, int& Count, double& MinAbsGrad) {
-        Count = 0;
-        MinAbsGrad = 1e10;
-        
-        for (auto& cell : FSimpleCells) {
-            for (auto& grad_row : cell.dWih) {
-                for (double g : grad_row) {
-                    double abs_g = std::abs(g);
-                    if (abs_g < Threshold) Count++;
-                    MinAbsGrad = std::min(MinAbsGrad, abs_g);
-                }
-            }
-        }
-        for (auto& cell : FLSTMCells) {
-            for (auto& grad_row : cell.dWf) {
-                for (double g : grad_row) {
-                    double abs_g = std::abs(g);
-                    if (abs_g < Threshold) Count++;
-                    MinAbsGrad = std::min(MinAbsGrad, abs_g);
-                }
-            }
+    void SetHiddenState(int LayerIdx, int Timestep, int NeuronIdx, double Value) {
+        if (LayerIdx >= 0 && LayerIdx < (int)FStates.size() &&
+            Timestep >= 0 && Timestep < (int)FStates[LayerIdx].size() &&
+            NeuronIdx >= 0 && NeuronIdx < (int)FStates[LayerIdx][Timestep].size()) {
+            FStates[LayerIdx][Timestep][NeuronIdx] = Value;
         }
     }
 
-    void DetectExplodingGradients(double Threshold, int& Count, double& MaxAbsGrad) {
-        Count = 0;
-        MaxAbsGrad = 0.0;
-        
-        for (auto& cell : FSimpleCells) {
-            for (auto& grad_row : cell.dWih) {
-                for (double g : grad_row) {
-                    double abs_g = std::abs(g);
-                    if (abs_g > Threshold) Count++;
-                    MaxAbsGrad = std::max(MaxAbsGrad, abs_g);
-                }
-            }
-        }
-        for (auto& cell : FLSTMCells) {
-            for (auto& grad_row : cell.dWf) {
-                for (double g : grad_row) {
-                    double abs_g = std::abs(g);
-                    if (abs_g > Threshold) Count++;
-                    MaxAbsGrad = std::max(MaxAbsGrad, abs_g);
-                }
-            }
-        }
+    double GetOutput(int Timestep, int OutputIdx) { return 0.0; }
+    void SetOutput(int Timestep, int OutputIdx, double Value) { }
+    double GetCellState(int LayerIdx, int Timestep, int NeuronIdx) { return 0.0; }
+    double GetGateValue(TGateType GateType, int LayerIdx, int Timestep, int NeuronIdx) { return 0.0; }
+    double GetPreActivation(int LayerIdx, int Timestep, int NeuronIdx) { return 0.0; }
+    double GetInputVector(int Timestep, int InputIdx) { return 0.0; }
+    double GetWeightGradient(int LayerIdx, int NeuronIdx, int WeightIdx) { return 0.0; }
+    double GetBiasGradient(int LayerIdx, int NeuronIdx) { return 0.0; }
+    
+    TOptimizerStateRecord GetOptimizerState(int LayerIdx, int NeuronIdx, int Param) {
+        TOptimizerStateRecord Result = {0.0, 0.0, 0.0, 0.0};
+        return Result;
+    }
+    
+    double GetCellGradient(int LayerIdx, int Timestep, int NeuronIdx) { return 0.0; }
+
+    void SetDropoutRate(double Rate) { FDropoutRate = Rate; }
+    double GetDropoutRate() const { return FDropoutRate; }
+    double GetDropoutMask(int LayerIdx, int Timestep, int NeuronIdx) { return 0.0; }
+    TLayerNormStats GetLayerNormStats(int LayerIdx, int Timestep) {
+        TLayerNormStats Result = {0.0, 0.0, 0.0, 0.0};
+        return Result;
+    }
+    void EnableDropout(bool Enable) { FUseDropout = Enable; }
+
+    DArray GetSequenceOutputs(int OutputIdx) {
+        DArray Result;
+        return Result;
     }
 
-    DArray2D GetSequenceOutputs() {
-        DArray2D Outputs;
-        for (int t = 0; t < FSequenceLen; t++) {
-            Outputs.push_back(FCaches[t].OutVal);
-        }
-        return Outputs;
+    DArray GetSequenceHiddenStates(int LayerIdx, int NeuronIdx) {
+        DArray Result;
+        return Result;
     }
 
-    DArray2D GetSequenceHiddenStates(int LayerIdx) {
-        DArray2D States;
-        if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size()) {
-            for (int t = 0; t < FSequenceLen; t++) {
-                if (t < (int)FCaches.size()) {
-                    States.push_back(FCaches[t].H);
-                }
-            }
-        }
-        return States;
+    DArray GetSequenceCellStates(int LayerIdx, int NeuronIdx) {
+        DArray Result;
+        return Result;
     }
 
-    int GetLayerCount() const { return FHiddenSizes.size(); }
+    DArray GetSequenceGateValues(TGateType GateType, int LayerIdx, int NeuronIdx) {
+        DArray Result;
+        return Result;
+    }
+
+    int GetInputSize() const { return FInputSize; }
+    int GetOutputSize() const { return FOutputSize; }
+    int GetNumHiddenLayers() const { return (int)FHiddenSizes.size(); }
     int GetHiddenSize(int LayerIdx) const {
-        if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size())
+        if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size()) {
             return FHiddenSizes[LayerIdx];
+        }
         return 0;
     }
     TCellType GetCellType() const { return FCellType; }
     int GetSequenceLength() const { return FSequenceLen; }
-    bool isGPUAvailable() const { return use_gpu && opencl && opencl->isInitialized(); }
-    void setUseGPU(bool use) { use_gpu = use; }
-    double getLearningRate() const { return FLearningRate; }
-    void setLearningRate(double value) { FLearningRate = value; }
-    double getGradientClip() const { return FGradientClip; }
-    void setGradientClip(double value) { FGradientClip = value; }
-    double getDropoutRate() const { return FDropoutRate; }
-    void setDropoutRate(double value) { FDropoutRate = value; FUseDropout = value > 0.0; }
 
-    // ========================================================================
-    // Model Persistence
-    // ========================================================================
-
-    bool SaveModel(const std::string& Filename) {
-        try {
-            std::ofstream file(Filename, std::ios::binary);
-            if (!file.is_open()) {
-                std::cerr << "Failed to open file for writing: " << Filename << std::endl;
-                return false;
-            }
-
-            // Write header
-            int cellTypeInt = (int)FCellType;
-            int actTypeInt = (int)FActivation;
-            int outActTypeInt = (int)FOutputActivation;
-            int lossTypeInt = (int)FLossType;
-            int numLayers = FHiddenSizes.size();
-
-            file.write((char*)&FInputSize, sizeof(int));
-            file.write((char*)&FOutputSize, sizeof(int));
-            file.write((char*)&numLayers, sizeof(int));
-            file.write((char*)&cellTypeInt, sizeof(int));
-            file.write((char*)&actTypeInt, sizeof(int));
-            file.write((char*)&outActTypeInt, sizeof(int));
-            file.write((char*)&lossTypeInt, sizeof(int));
-            file.write((char*)&FLearningRate, sizeof(double));
-            file.write((char*)&FGradientClip, sizeof(double));
-
-            // Write hidden sizes
-            for (int h : FHiddenSizes) {
-                file.write((char*)&h, sizeof(int));
-            }
-
-            // Write SimpleRNN cells
-            for (auto& cell : FSimpleCells) {
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < cell.FInputSize; j++) {
-                        file.write((char*)&cell.Wih[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < cell.FHiddenSize; j++) {
-                        file.write((char*)&cell.Whh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    file.write((char*)&cell.Bh[i], sizeof(double));
-                }
-            }
-
-            // Write LSTM cells
-            for (auto& cell : FLSTMCells) {
-                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.write((char*)&cell.Wf[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.write((char*)&cell.Wi[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.write((char*)&cell.Wc[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.write((char*)&cell.Wo[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    file.write((char*)&cell.Bf[i], sizeof(double));
-                    file.write((char*)&cell.Bi[i], sizeof(double));
-                    file.write((char*)&cell.Bc[i], sizeof(double));
-                    file.write((char*)&cell.Bo[i], sizeof(double));
-                }
-            }
-
-            // Write GRU cells
-            for (auto& cell : FGRUCells) {
-                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.write((char*)&cell.Wz[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.write((char*)&cell.Wr[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.write((char*)&cell.Wh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    file.write((char*)&cell.Bz[i], sizeof(double));
-                    file.write((char*)&cell.Br[i], sizeof(double));
-                    file.write((char*)&cell.Bh[i], sizeof(double));
-                }
-            }
-
-            // Write output layer
-            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
-                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
-                    file.write((char*)&FOutputLayer->W[i][j], sizeof(double));
-                }
-            }
-            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
-                file.write((char*)&FOutputLayer->B[i], sizeof(double));
-            }
-
-            file.close();
-            return true;
-        } catch (...) {
-            std::cerr << "Error saving model" << std::endl;
-            return false;
+    void SaveModel(const std::string& Filename) {
+        std::ofstream File(Filename);
+        if (!File.is_open()) {
+            std::cerr << "Error: Could not open file for writing: " << Filename << "\n";
+            return;
         }
+
+        File << "{\n";
+        File << "  \"input_size\": " << FInputSize << ",\n";
+        File << "  \"output_size\": " << FOutputSize << ",\n";
+        File << "  \"hidden_sizes\": [\n";
+        for (size_t i = 0; i < FHiddenSizes.size(); ++i) {
+            if (i > 0) File << ",\n";
+            File << "    " << FHiddenSizes[i];
+        }
+        File << "\n  ],\n";
+
+        std::string CellTypeStr = CellTypeToStr(FCellType);
+        File << "  \"cell_type\": \"" << CellTypeStr << "\",\n";
+        File << "  \"activation\": \"" << ActivationToStr(FActivation) << "\",\n";
+        File << "  \"output_activation\": \"" << ActivationToStr(FOutputActivation) << "\",\n";
+        File << "  \"loss_type\": \"" << LossToStr(FLossType) << "\",\n";
+        File << "  \"learning_rate\": " << FLearningRate << ",\n";
+        File << "  \"gradient_clip\": " << FGradientClip << ",\n";
+        File << "  \"bptt_steps\": " << FBPTTSteps << ",\n";
+        File << "  \"dropout_rate\": " << FDropoutRate << ",\n";
+
+        switch (FCellType) {
+            case ctSimpleRNN:
+                File << "  \"cells\": [\n";
+                for (size_t i = 0; i < FSimpleCells.size(); ++i) {
+                    if (i > 0) File << ",\n";
+                    File << "    {\n";
+                    File << "      \"Wih\": " << Array2DToJSON(FSimpleCells[i]->Wih) << ",\n";
+                    File << "      \"Whh\": " << Array2DToJSON(FSimpleCells[i]->Whh) << ",\n";
+                    File << "      \"Bh\": " << Array1DToJSON(FSimpleCells[i]->Bh) << "\n";
+                    File << "    }";
+                }
+                File << "\n  ]\n";
+                break;
+            case ctLSTM:
+                File << "  \"cells\": [\n";
+                for (size_t i = 0; i < FLSTMCells.size(); ++i) {
+                    if (i > 0) File << ",\n";
+                    File << "    {\n";
+                    File << "      \"Wf\": " << Array2DToJSON(FLSTMCells[i]->Wf) << ",\n";
+                    File << "      \"Wi\": " << Array2DToJSON(FLSTMCells[i]->Wi) << ",\n";
+                    File << "      \"Wc\": " << Array2DToJSON(FLSTMCells[i]->Wc) << ",\n";
+                    File << "      \"Wo\": " << Array2DToJSON(FLSTMCells[i]->Wo) << ",\n";
+                    File << "      \"Bf\": " << Array1DToJSON(FLSTMCells[i]->Bf) << ",\n";
+                    File << "      \"Bi\": " << Array1DToJSON(FLSTMCells[i]->Bi) << ",\n";
+                    File << "      \"Bc\": " << Array1DToJSON(FLSTMCells[i]->Bc) << ",\n";
+                    File << "      \"Bo\": " << Array1DToJSON(FLSTMCells[i]->Bo) << "\n";
+                    File << "    }";
+                }
+                File << "\n  ]\n";
+                break;
+            case ctGRU:
+                File << "  \"cells\": [\n";
+                for (size_t i = 0; i < FGRUCells.size(); ++i) {
+                    if (i > 0) File << ",\n";
+                    File << "    {\n";
+                    File << "      \"Wz\": " << Array2DToJSON(FGRUCells[i]->Wz) << ",\n";
+                    File << "      \"Wr\": " << Array2DToJSON(FGRUCells[i]->Wr) << ",\n";
+                    File << "      \"Wh\": " << Array2DToJSON(FGRUCells[i]->Wh) << ",\n";
+                    File << "      \"Bz\": " << Array1DToJSON(FGRUCells[i]->Bz) << ",\n";
+                    File << "      \"Br\": " << Array1DToJSON(FGRUCells[i]->Br) << ",\n";
+                    File << "      \"Bh\": " << Array1DToJSON(FGRUCells[i]->Bh) << "\n";
+                    File << "    }";
+                }
+                File << "\n  ]\n";
+                break;
+        }
+
+        File << ",\n";
+        File << "  \"output_layer\": {\n";
+        File << "    \"W\": " << Array2DToJSON(FOutputLayer->W) << ",\n";
+        File << "    \"B\": " << Array1DToJSON(FOutputLayer->B) << "\n";
+        File << "  }\n";
+        File << "}\n";
+        File.close();
+        std::cout << "Model saved to JSON: " << Filename << "\n";
     }
 
-    bool LoadModel(const std::string& Filename) {
-        try {
-            std::ifstream file(Filename, std::ios::binary);
-            if (!file.is_open()) {
-                std::cerr << "Failed to open file for reading: " << Filename << std::endl;
-                return false;
-            }
-
-            // Read header
-            int cellTypeInt, actTypeInt, outActTypeInt, lossTypeInt, numLayers;
-            file.read((char*)&FInputSize, sizeof(int));
-            file.read((char*)&FOutputSize, sizeof(int));
-            file.read((char*)&numLayers, sizeof(int));
-            file.read((char*)&cellTypeInt, sizeof(int));
-            file.read((char*)&actTypeInt, sizeof(int));
-            file.read((char*)&outActTypeInt, sizeof(int));
-            file.read((char*)&lossTypeInt, sizeof(int));
-            file.read((char*)&FLearningRate, sizeof(double));
-            file.read((char*)&FGradientClip, sizeof(double));
-
-            FCellType = (TCellType)cellTypeInt;
-            FActivation = (TActivationType)actTypeInt;
-            FOutputActivation = (TActivationType)outActTypeInt;
-            FLossType = (TLossType)lossTypeInt;
-
-            // Read hidden sizes
-            FHiddenSizes.clear();
-            for (int i = 0; i < numLayers; i++) {
-                int h;
-                file.read((char*)&h, sizeof(int));
-                FHiddenSizes.push_back(h);
-            }
-
-            // Reinitialize cells based on loaded config
-            FSimpleCells.clear();
-            FLSTMCells.clear();
-            FGRUCells.clear();
-
-            if (FCellType == TCellType::ctSimpleRNN) {
-                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
-                    FSimpleCells.emplace_back(InSize, FHiddenSizes[i], FActivation);
-                }
-            } else if (FCellType == TCellType::ctLSTM) {
-                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
-                    FLSTMCells.emplace_back(InSize, FHiddenSizes[i], FActivation);
-                }
-            } else if (FCellType == TCellType::ctGRU) {
-                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
-                    FGRUCells.emplace_back(InSize, FHiddenSizes[i], FActivation);
-                }
-            }
-
-            if (FOutputLayer) delete FOutputLayer;
-            FOutputLayer = new TOutputLayerWrapper(FHiddenSizes.back(), FOutputSize, FOutputActivation);
-
-            // Read SimpleRNN cells
-            for (auto& cell : FSimpleCells) {
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < cell.FInputSize; j++) {
-                        file.read((char*)&cell.Wih[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < cell.FHiddenSize; j++) {
-                        file.read((char*)&cell.Whh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    file.read((char*)&cell.Bh[i], sizeof(double));
-                }
-            }
-
-            // Read LSTM cells
-            for (auto& cell : FLSTMCells) {
-                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.read((char*)&cell.Wf[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.read((char*)&cell.Wi[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.read((char*)&cell.Wc[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.read((char*)&cell.Wo[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    file.read((char*)&cell.Bf[i], sizeof(double));
-                    file.read((char*)&cell.Bi[i], sizeof(double));
-                    file.read((char*)&cell.Bc[i], sizeof(double));
-                    file.read((char*)&cell.Bo[i], sizeof(double));
-                }
-            }
-
-            // Read GRU cells
-            for (auto& cell : FGRUCells) {
-                int inputPlusHidden = cell.FInputSize + cell.FHiddenSize;
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.read((char*)&cell.Wz[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.read((char*)&cell.Wr[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    for (int j = 0; j < inputPlusHidden; j++) {
-                        file.read((char*)&cell.Wh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell.FHiddenSize; i++) {
-                    file.read((char*)&cell.Bz[i], sizeof(double));
-                    file.read((char*)&cell.Br[i], sizeof(double));
-                    file.read((char*)&cell.Bh[i], sizeof(double));
-                }
-            }
-
-            // Read output layer
-            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
-                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
-                    file.read((char*)&FOutputLayer->W[i][j], sizeof(double));
-                }
-            }
-            for (int i = 0; i < FOutputLayer->FOutputSize; i++) {
-                file.read((char*)&FOutputLayer->B[i], sizeof(double));
-            }
-
-            file.close();
-            FStates = InitHiddenStates();
-            return true;
-        } catch (...) {
-            std::cerr << "Error loading model" << std::endl;
-            return false;
+    void LoadModel(const std::string& Filename) {
+        std::ifstream File(Filename);
+        if (!File.is_open()) {
+            std::cerr << "Error: Could not open file for reading: " << Filename << "\n";
+            return;
         }
+
+        std::stringstream Buffer;
+        Buffer << File.rdbuf();
+        std::string Content = Buffer.str();
+        File.close();
+
+        // Extract model parameters from JSON
+        auto ExtractJSONValue = [](const std::string& json, const std::string& key) -> std::string {
+            std::string searchKey = "\"" + key + "\"";
+            size_t keyPos = json.find(searchKey);
+            if (keyPos == std::string::npos) return "";
+            size_t colonPos = json.find(':', keyPos);
+            if (colonPos == std::string::npos) return "";
+            size_t startPos = colonPos + 1;
+            while (startPos < json.length() && (json[startPos] == ' ' || json[startPos] == '\t' 
+                   || json[startPos] == '\n' || json[startPos] == '\r')) {
+                ++startPos;
+            }
+            if (startPos < json.length() && json[startPos] == '"') {
+                size_t quotePos1 = startPos;
+                size_t quotePos2 = json.find('"', quotePos1 + 1);
+                if (quotePos2 != std::string::npos) {
+                    return json.substr(quotePos1 + 1, quotePos2 - quotePos1 - 1);
+                }
+                return "";
+            }
+            if (startPos < json.length() && json[startPos] == '[') {
+                size_t bracketCount = 1;
+                size_t endPos = startPos + 1;
+                while (endPos < json.length() && bracketCount > 0) {
+                    if (json[endPos] == '[') bracketCount++;
+                    else if (json[endPos] == ']') bracketCount--;
+                    if (bracketCount > 0) endPos++;
+                }
+                return json.substr(startPos, endPos - startPos + 1);
+            }
+            size_t endPos = json.find(',', startPos);
+            if (endPos == std::string::npos) endPos = json.find('}', startPos);
+            if (endPos == std::string::npos) endPos = json.find(']', startPos);
+            std::string result = json.substr(startPos, endPos - startPos);
+            size_t end = result.find_last_not_of(" \t\n\r");
+            if (end != std::string::npos) {
+                result = result.substr(0, end + 1);
+            }
+            return result;
+        };
+        
+        std::string inputStr = ExtractJSONValue(Content, "input_size");
+        int inputSize = inputStr.empty() ? 1 : std::stoi(inputStr);
+        
+        std::string outputStr = ExtractJSONValue(Content, "output_size");
+        int outputSize = outputStr.empty() ? 1 : std::stoi(outputStr);
+        
+        std::string cellTypeStr = ExtractJSONValue(Content, "cell_type");
+        TCellType cellType = ParseCellType(cellTypeStr);
+        
+        std::string hiddenStr = ExtractJSONValue(Content, "hidden_sizes");
+        
+        std::string activationStr = ExtractJSONValue(Content, "hidden_activation");
+        if (activationStr.empty()) activationStr = ExtractJSONValue(Content, "activation");
+        if (activationStr.empty()) activationStr = "tanh";
+        
+        std::string outputActStr = ExtractJSONValue(Content, "output_activation");
+        if (outputActStr.empty()) outputActStr = "linear";
+        
+        std::string lossStr = ExtractJSONValue(Content, "loss_type");
+        if (lossStr.empty()) lossStr = "mse";
+        
+        std::string lrStr = ExtractJSONValue(Content, "learning_rate");
+        double learningRate = lrStr.empty() ? 0.01 : std::stod(lrStr);
+        
+        std::string clipStr = ExtractJSONValue(Content, "gradient_clip");
+        double gradientClip = clipStr.empty() ? 5.0 : std::stod(clipStr);
+        
+        std::string bpttStr = ExtractJSONValue(Content, "bptt_steps");
+        int bpttSteps = bpttStr.empty() ? 0 : std::stoi(bpttStr);
+        
+        std::string dropoutStr = ExtractJSONValue(Content, "dropout_rate");
+        double dropoutRate = dropoutStr.empty() ? 0.0 : std::stod(dropoutStr);
+        
+        // Parse hidden sizes
+        TIntArray hiddenSizes;
+        // Extract from array notation [5,3]
+        size_t openBracket = hiddenStr.find('[');
+        size_t closeBracket = hiddenStr.rfind(']');
+        if (openBracket != std::string::npos && closeBracket != std::string::npos) {
+            std::string arrayContent = hiddenStr.substr(openBracket + 1, closeBracket - openBracket - 1);
+            std::stringstream ss(arrayContent);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                // Trim whitespace
+                size_t start = token.find_first_not_of(" \t\n\r");
+                size_t end = token.find_last_not_of(" \t\n\r");
+                if (start != std::string::npos && end != std::string::npos) {
+                    token = token.substr(start, end - start + 1);
+                    if (!token.empty()) {
+                        hiddenSizes.push_back(std::stoi(token));
+                    }
+                }
+            }
+        } else {
+            // Single value
+            if (!hiddenStr.empty()) {
+                hiddenSizes.push_back(std::stoi(hiddenStr));
+            }
+        }
+        
+        // Reinitialize the model with proper dimensions
+        FInputSize = inputSize;
+        FOutputSize = outputSize;
+        FHiddenSizes = hiddenSizes;
+        FCellType = cellType;
+        FActivation = ParseActivation(activationStr);
+        FOutputActivation = ParseActivation(outputActStr);
+        FLossType = ParseLoss(lossStr);
+        FLearningRate = learningRate;
+        FGradientClip = gradientClip;
+        FBPTTSteps = bpttSteps;
+        FDropoutRate = dropoutRate;
+        
+        // Clear old cells
+        for (auto cell : FSimpleCells) delete cell;
+        for (auto cell : FLSTMCells) delete cell;
+        for (auto cell : FGRUCells) delete cell;
+        FSimpleCells.clear();
+        FLSTMCells.clear();
+        FGRUCells.clear();
+        if (FOutputLayer) delete FOutputLayer;
+        
+        // Create new cells with proper dimensions
+        int PrevSize = inputSize;
+        switch (cellType) {
+            case ctSimpleRNN:
+                for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+                    FSimpleCells.push_back(new TSimpleRNNCellWrapper(PrevSize, hiddenSizes[i], FActivation));
+                    PrevSize = hiddenSizes[i];
+                }
+                break;
+            case ctLSTM:
+                for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+                    FLSTMCells.push_back(new TLSTMCellWrapper(PrevSize, hiddenSizes[i], FActivation));
+                    PrevSize = hiddenSizes[i];
+                }
+                break;
+            case ctGRU:
+                for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+                    FGRUCells.push_back(new TGRUCellWrapper(PrevSize, hiddenSizes[i], FActivation));
+                    PrevSize = hiddenSizes[i];
+                }
+                break;
+        }
+        
+        FOutputLayer = new TOutputLayerWrapper(PrevSize, outputSize, FOutputActivation);
+        FStates = InitHiddenStates();
+        
+        std::cout << "Model loaded from JSON: " << Filename << "\n";
     }
+
+    double GetLearningRate() const { return FLearningRate; }
+    void SetLearningRate(double Value) { FLearningRate = Value; }
+    double GetGradientClip() const { return FGradientClip; }
+    void SetGradientClip(double Value) { FGradientClip = Value; }
 };
 
-// ============================================================================
-// CLI Entry Point
-// ============================================================================
-
-void ShowHelp(const char* progName) {
-    std::cout << "RNN Facade CLI (OpenCL GPU) - Matthew Abbott 2025" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Usage: " << progName << " <command> [options]" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Commands:" << std::endl;
-    std::cout << "  create              Create and initialize an RNN model" << std::endl;
-    std::cout << "  train               Train the model on data" << std::endl;
-    std::cout << "  predict             Run prediction on input data" << std::endl;
-    std::cout << "  save                Save model weights to file" << std::endl;
-    std::cout << "  load                Load model weights from file" << std::endl;
-    std::cout << "  info                Display GPU information" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Facade Introspection Commands:" << std::endl;
-    std::cout << "  get-hidden          Get hidden state value" << std::endl;
-    std::cout << "  set-hidden          Set hidden state value" << std::endl;
-    std::cout << "  get-output          Get output value at timestep" << std::endl;
-    std::cout << "  get-cell-state      Get LSTM cell state" << std::endl;
-    std::cout << "  get-gate            Get gate value (LSTM/GRU)" << std::endl;
-    std::cout << "  get-preactivation   Get pre-activation value" << std::endl;
-    std::cout << "  get-input           Get input vector value" << std::endl;
-    std::cout << "  reset-states        Reset all hidden/cell states" << std::endl;
-    std::cout << "  set-dropout         Set dropout rate" << std::endl;
-    std::cout << "  get-dropout         Get current dropout rate" << std::endl;
-    std::cout << "  detect-vanishing    Check for vanishing gradients" << std::endl;
-    std::cout << "  detect-exploding    Check for exploding gradients" << std::endl;
-    std::cout << "  get-seq-outputs     Get all outputs for a sequence" << std::endl;
-    std::cout << "  get-seq-hidden      Get hidden states over sequence" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Create/Train/Predict options:" << std::endl;
-    std::cout << "  --input-size <n>       Input dimension (required)" << std::endl;
-    std::cout << "  --hidden-sizes <n,n>   Comma-separated hidden layer sizes (required)" << std::endl;
-    std::cout << "  --output-size <n>      Output dimension (required)" << std::endl;
-    std::cout << "  --cell-type <type>     rnn, lstm, or gru (default: lstm)" << std::endl;
-    std::cout << "  --activation <type>    sigmoid, tanh, relu, linear (default: tanh)" << std::endl;
-    std::cout << "  --output-activation    Output layer activation (default: sigmoid)" << std::endl;
-    std::cout << "  --loss <type>          mse or crossentropy (default: mse)" << std::endl;
-    std::cout << "  --learning-rate <f>    Learning rate (default: 0.01)" << std::endl;
-    std::cout << "  --gradient-clip <f>    Gradient clipping value (default: 5.0)" << std::endl;
-    std::cout << "  --bptt-steps <n>       BPTT truncation steps (default: 0 = full)" << std::endl;
-    std::cout << "  --epochs <n>           Number of training epochs (default: 100)" << std::endl;
-    std::cout << "  --input-file <file>    CSV file with input sequences" << std::endl;
-    std::cout << "  --target-file <file>   CSV file with target sequences" << std::endl;
-    std::cout << "  --output-file <file>   CSV file to write predictions" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Facade options:" << std::endl;
-    std::cout << "  --layer <n>            Layer index (default: 0)" << std::endl;
-    std::cout << "  --timestep <n>         Timestep index (default: 0)" << std::endl;
-    std::cout << "  --neuron <n>           Neuron index (default: 0)" << std::endl;
-    std::cout << "  --output-idx <n>       Output index (default: 0)" << std::endl;
-    std::cout << "  --value <f>            Value to set" << std::endl;
-    std::cout << "  --gate <type>          Gate type: forget,input,output,cell,update,reset,hidden" << std::endl;
-    std::cout << "  --threshold <f>        Threshold for gradient detection (default: 1e-6)" << std::endl;
+// ========== Helper Functions ==========
+std::string CellTypeToStr(TCellType ct) {
+    switch (ct) {
+        case ctSimpleRNN: return "simplernn";
+        case ctLSTM: return "lstm";
+        case ctGRU: return "gru";
+        default: return "simplernn";
+    }
 }
 
-TCellType ParseCellType(const std::string& str) {
-    if (str == "rnn") return TCellType::ctSimpleRNN;
-    if (str == "lstm") return TCellType::ctLSTM;
-    if (str == "gru") return TCellType::ctGRU;
-    return TCellType::ctLSTM;
+std::string ActivationToStr(TActivationType act) {
+    switch (act) {
+        case atSigmoid: return "sigmoid";
+        case atTanh: return "tanh";
+        case atReLU: return "relu";
+        case atLinear: return "linear";
+        default: return "linear";
+    }
 }
 
-TActivationType ParseActivation(const std::string& str) {
-    if (str == "sigmoid") return TActivationType::atSigmoid;
-    if (str == "tanh") return TActivationType::atTanh;
-    if (str == "relu") return TActivationType::atReLU;
-    if (str == "linear") return TActivationType::atLinear;
-    return TActivationType::atTanh;
+std::string LossToStr(TLossType loss) {
+    switch (loss) {
+        case ltMSE: return "mse";
+        case ltCrossEntropy: return "crossentropy";
+        default: return "mse";
+    }
 }
 
-TLossType ParseLossType(const std::string& str) {
-    if (str == "mse") return TLossType::ltMSE;
-    if (str == "crossentropy") return TLossType::ltCrossEntropy;
-    return TLossType::ltMSE;
+TCellType ParseCellType(const std::string& s) {
+    std::string s_lower = s;
+    std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(), ::tolower);
+    if (s_lower == "lstm") return ctLSTM;
+    if (s_lower == "gru") return ctGRU;
+    return ctSimpleRNN;
 }
 
-TGateType ParseGateType(const std::string& str) {
-    if (str == "forget") return TGateType::gtForget;
-    if (str == "input") return TGateType::gtInput;
-    if (str == "output") return TGateType::gtOutput;
-    if (str == "cell") return TGateType::gtCellCandidate;
-    if (str == "update") return TGateType::gtUpdate;
-    if (str == "reset") return TGateType::gtReset;
-    if (str == "hidden") return TGateType::gtHiddenCandidate;
-    return TGateType::gtForget;
+TActivationType ParseActivation(const std::string& s) {
+    std::string s_lower = s;
+    std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(), ::tolower);
+    if (s_lower == "sigmoid") return atSigmoid;
+    if (s_lower == "tanh") return atTanh;
+    if (s_lower == "relu") return atReLU;
+    return atLinear;
 }
 
-std::vector<int> ParseHiddenSizes(const std::string& str) {
-    std::vector<int> result;
-    std::stringstream ss(str);
+TLossType ParseLoss(const std::string& s) {
+    std::string s_lower = s;
+    std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(), ::tolower);
+    if (s_lower == "crossentropy") return ltCrossEntropy;
+    return ltMSE;
+}
+
+bool ParseIntArrayHelper(const std::string& s, TIntArray& arr) {
+    arr.clear();
+    std::stringstream ss(s);
     std::string item;
     while (std::getline(ss, item, ',')) {
-        result.push_back(std::stoi(item));
+        item.erase(0, item.find_first_not_of(" \t"));
+        item.erase(item.find_last_not_of(" \t") + 1);
+        try {
+            arr.push_back(std::stoi(item));
+        } catch (...) {
+            return false;
+        }
     }
-    return result.empty() ? std::vector<int>{64, 32} : result;
+    return true;
 }
 
+void ParseDoubleArrayHelper(const std::string& s, DArray& arr) {
+    arr.clear();
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item.erase(0, item.find_first_not_of(" \t"));
+        item.erase(item.find_last_not_of(" \t") + 1);
+        arr.push_back(std::stod(item));
+    }
+}
+
+void LoadDataFromCSV(const std::string& Filename, TDArray2D& Inputs, TDArray2D& Targets) {
+    std::ifstream File(Filename);
+    if (!File.is_open()) {
+        std::cerr << "Error: Could not open CSV file: " << Filename << "\n";
+        return;
+    }
+
+    std::string Line;
+    while (std::getline(File, Line)) {
+        if (Line.empty()) continue;
+
+        std::stringstream ss(Line);
+        std::string Item;
+        std::vector<double> Values;
+
+        while (std::getline(ss, Item, ',')) {
+            Item.erase(0, Item.find_first_not_of(" \t"));
+            Item.erase(Item.find_last_not_of(" \t") + 1);
+            try {
+                Values.push_back(std::stod(Item));
+            } catch (...) {
+                continue;
+            }
+        }
+
+        if (Values.size() >= 2) {
+            size_t SplitPoint = Values.size() / 2;
+            DArray Input(Values.begin(), Values.begin() + SplitPoint);
+            DArray Target(Values.begin() + SplitPoint, Values.end());
+            Inputs.push_back(Input);
+            Targets.push_back(Target);
+        }
+    }
+
+    File.close();
+}
+
+void PrintUsage() {
+    std::cout << "Facaded RNN (OpenCL Accelerated)\n\n";
+    std::cout << "Commands:\n";
+    std::cout << "  create   Create a new RNN model and save to JSON\n";
+    std::cout << "  train    Train an existing model with data from JSON\n";
+    std::cout << "  predict  Make predictions with a trained model from JSON\n";
+    std::cout << "  info     Display model information from JSON\n";
+    std::cout << "  query    Query model state and internals (facade functions)\n";
+    std::cout << "  help     Show this help message\n\n";
+    std::cout << "Create Options:\n";
+    std::cout << "  --input=N              Input layer size (required)\n";
+    std::cout << "  --hidden=N,N,...       Hidden layer sizes (required)\n";
+    std::cout << "  --output=N             Output layer size (required)\n";
+    std::cout << "  --save=FILE.json       Save model to JSON file (required)\n";
+    std::cout << "  --cell=TYPE            simplernn|lstm|gru (default: lstm)\n";
+    std::cout << "  --lr=VALUE             Learning rate (default: 0.01)\n";
+    std::cout << "  --hidden-act=TYPE      sigmoid|tanh|relu|linear (default: tanh)\n";
+    std::cout << "  --output-act=TYPE      sigmoid|tanh|relu|linear (default: linear)\n";
+    std::cout << "  --loss=TYPE            mse|crossentropy (default: mse)\n";
+    std::cout << "  --clip=VALUE           Gradient clipping (default: 5.0)\n";
+    std::cout << "  --bptt=N               BPTT steps (default: 0 = full)\n\n";
+    std::cout << "Train Options:\n";
+    std::cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    std::cout << "  --data=FILE.csv        Training data CSV file (required)\n";
+    std::cout << "  --save=FILE.json       Save trained model to JSON (required)\n";
+    std::cout << "  --epochs=N             Number of training epochs (default: 100)\n";
+    std::cout << "  --batch=N              Batch size (default: 1)\n";
+    std::cout << "  --lr=VALUE             Override learning rate\n";
+    std::cout << "  --seq-len=N            Sequence length (default: auto-detect)\n\n";
+    std::cout << "Predict Options:\n";
+    std::cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    std::cout << "  --input=v1,v2,...      Input values as CSV (required)\n\n";
+    std::cout << "Info Options:\n";
+    std::cout << "  --model=FILE.json      Load model from JSON file (required)\n\n";
+    std::cout << "Query Options (Facade Functions):\n";
+    std::cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    std::cout << "  --query-type=TYPE      Query type (required)\n";
+    std::cout << "  --layer=N              Layer index\n";
+    std::cout << "  --timestep=N           Timestep index\n";
+    std::cout << "  --neuron=N             Neuron index\n";
+    std::cout << "  --index=N              Generic index parameter\n";
+    std::cout << "  --dropout-rate=VALUE   Set dropout rate (0.0-1.0)\n";
+    std::cout << "  --enable-dropout       Enable dropout\n";
+    std::cout << "  --disable-dropout      Disable dropout\n\n";
+    std::cout << "Examples:\n";
+    std::cout << "  facaded_rnn create --input=2 --hidden=16 --output=2 --cell=lstm --save=seq.json\n";
+    std::cout << "  facaded_rnn train --model=seq.json --data=seq.csv --epochs=200 --save=seq_trained.json\n";
+    std::cout << "  facaded_rnn predict --model=seq_trained.json --input=0.5,0.5\n";
+    std::cout << "  facaded_rnn info --model=seq_trained.json\n";
+}
+
+// ========== Main Program ==========
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        ShowHelp(argv[0]);
+        PrintUsage();
+        return 1;
+    }
+
+    std::string CmdStr = argv[1];
+    TCommand Command = cmdNone;
+
+    if (CmdStr == "create") Command = cmdCreate;
+    else if (CmdStr == "train") Command = cmdTrain;
+    else if (CmdStr == "predict") Command = cmdPredict;
+    else if (CmdStr == "info") Command = cmdInfo;
+    else if (CmdStr == "query") Command = cmdQuery;
+    else if (CmdStr == "help" || CmdStr == "--help" || CmdStr == "-h") Command = cmdHelp;
+    else {
+        std::cerr << "Unknown command: " << CmdStr << "\n";
+        PrintUsage();
+        return 1;
+    }
+
+    if (Command == cmdHelp) {
+        PrintUsage();
         return 0;
     }
 
-    std::string command = argv[1];
+    int inputSize = 0;
+    int outputSize = 0;
+    TIntArray hiddenSizes;
+    double learningRate = 0.01;
+    double gradientClip = 5.0;
+    int epochs = 100;
+    int batchSize = 1;
+    int seqLen = 0;
+    int bpttSteps = 0;
+    bool verbose = false;
+    TActivationType hiddenAct = atTanh;
+    TActivationType outputAct = atLinear;
+    TCellType cellType = ctLSTM;
+    TLossType lossType = ltMSE;
+    std::string modelFile, saveFile, dataFile;
+    DArray inputValues;
 
-    // Default parameters
-    int InputSize = 10;
-    std::vector<int> HiddenSizes = {64, 32};
-    int OutputSize = 5;
-    TCellType CellType = TCellType::ctLSTM;
-    TActivationType Activation = TActivationType::atTanh;
-    TActivationType OutputActivation = TActivationType::atSigmoid;
-    TLossType LossType = TLossType::ltMSE;
-    double LearningRate = 0.01;
-    double GradientClip = 5.0;
-    int BPTTSteps = 0;
-    int Epochs = 100;
+    std::string queryType, gateTypeStr;
+    int layer = 0, timestep = 0, neuron = 0, index = 0, param = 0;
+    double dropoutValue = 0.0;
+    bool enableDropoutFlag = false, disableDropoutFlag = false;
 
-    // Introspection parameters
-    int LayerIdx = 0;
-    int Timestep = 0;
-    int NeuronIdx = 0;
-    int OutputIdx = 0;
-    double Value = 0.0;
-    TGateType Gate = TGateType::gtForget;
-    double Threshold = 1e-6;
-
-    std::string InputFile, TargetFile, OutputFile, ModelFile;
-
-    // Parse command-specific arguments
-    for (int i = 2; i < argc; i++) {
+    for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
+
+        if (arg == "--verbose") {
+            verbose = true;
+        } else if (arg == "--enable-dropout") {
+            enableDropoutFlag = true;
+        } else if (arg == "--disable-dropout") {
+            disableDropoutFlag = true;
+        } else {
+            size_t eqPos = arg.find('=');
+            if (eqPos == std::string::npos) {
+                std::cerr << "Invalid argument: " << arg << "\n";
+                continue;
+            }
+
+            std::string key = arg.substr(0, eqPos);
+            std::string value = arg.substr(eqPos + 1);
+
+            if (key == "--input") {
+                if (Command == cmdPredict) {
+                    ParseDoubleArrayHelper(value, inputValues);
+                } else {
+                    inputSize = std::stoi(value);
+                }
+            } else if (key == "--hidden") {
+                ParseIntArrayHelper(value, hiddenSizes);
+            } else if (key == "--output") {
+                outputSize = std::stoi(value);
+            } else if (key == "--save") {
+                saveFile = value;
+            } else if (key == "--model") {
+                modelFile = value;
+            } else if (key == "--data") {
+                dataFile = value;
+            } else if (key == "--lr") {
+                learningRate = std::stod(value);
+            } else if (key == "--cell") {
+                cellType = ParseCellType(value);
+            } else if (key == "--hidden-act") {
+                hiddenAct = ParseActivation(value);
+            } else if (key == "--output-act") {
+                outputAct = ParseActivation(value);
+            } else if (key == "--loss") {
+                lossType = ParseLoss(value);
+            } else if (key == "--clip") {
+                gradientClip = std::stod(value);
+            } else if (key == "--bptt") {
+                bpttSteps = std::stoi(value);
+            } else if (key == "--epochs") {
+                epochs = std::stoi(value);
+            } else if (key == "--batch") {
+                batchSize = std::stoi(value);
+            } else if (key == "--seq-len") {
+                seqLen = std::stoi(value);
+            } else if (key == "--query-type") {
+                queryType = value;
+            } else if (key == "--layer") {
+                layer = std::stoi(value);
+            } else if (key == "--timestep") {
+                timestep = std::stoi(value);
+            } else if (key == "--neuron") {
+                neuron = std::stoi(value);
+            } else if (key == "--index") {
+                index = std::stoi(value);
+            } else if (key == "--gate") {
+                gateTypeStr = value;
+            } else if (key == "--param") {
+                param = std::stoi(value);
+            } else if (key == "--dropout-rate") {
+                dropoutValue = std::stod(value);
+            } else {
+                std::cerr << "Unknown option: " << key << "\n";
+            }
+        }
+    }
+
+    if (Command == cmdCreate) {
+        if (inputSize <= 0) { std::cerr << "Error: --input is required\n"; return 1; }
+        if (hiddenSizes.empty()) { std::cerr << "Error: --hidden is required\n"; return 1; }
+        if (outputSize <= 0) { std::cerr << "Error: --output is required\n"; return 1; }
+        if (saveFile.empty()) { std::cerr << "Error: --save is required\n"; return 1; }
+
+        TRNNFacade* RNN = new TRNNFacade(inputSize, hiddenSizes, outputSize, cellType,
+                                         hiddenAct, outputAct, lossType, learningRate,
+                                         gradientClip, bpttSteps);
+
+        std::cout << "Created RNN model:\n";
+        std::cout << "  Input size: " << inputSize << "\n";
+        std::cout << "  Hidden sizes: ";
+        for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+            if (i > 0) std::cout << ",";
+            std::cout << hiddenSizes[i];
+        }
+        std::cout << "\n";
+        std::cout << "  Output size: " << outputSize << "\n";
+        std::cout << "  Cell type: " << CellTypeToStr(cellType) << "\n";
+        std::cout << "  Hidden activation: " << ActivationToStr(hiddenAct) << "\n";
+        std::cout << "  Output activation: " << ActivationToStr(outputAct) << "\n";
+        std::cout << "  Loss function: " << LossToStr(lossType) << "\n";
+        std::cout << std::fixed << std::setprecision(6)
+                  << "  Learning rate: " << learningRate << "\n";
+        std::cout << std::fixed << std::setprecision(2)
+                  << "  Gradient clip: " << gradientClip << "\n";
+        std::cout << "  BPTT steps: " << bpttSteps << "\n";
+
+        RNN->SaveModel(saveFile);
+        delete RNN;
+    }
+    else if (Command == cmdTrain) {
+        if (modelFile.empty()) { std::cerr << "Error: --model is required\n"; return 1; }
+        if (dataFile.empty()) { std::cerr << "Error: --data is required\n"; return 1; }
+        if (saveFile.empty()) { std::cerr << "Error: --save is required\n"; return 1; }
+
+        std::cout << "Loading model from JSON: " << modelFile << "\n";
+        TRNNFacade* RNN = new TRNNFacade(1, {1}, 1, ctLSTM, atTanh, atLinear, ltMSE, 0.01, 5.0, 0);
+        RNN->LoadModel(modelFile);
+        std::cout << "Model loaded successfully.\n";
+
+        std::cout << "Loading training data from: " << dataFile << "\n";
+        TDArray2D Inputs, Targets;
+        LoadDataFromCSV(dataFile, Inputs, Targets);
+
+        if (Inputs.empty()) {
+            std::cerr << "Error: No data loaded from CSV file\n";
+            delete RNN;
+            return 1;
+        }
+
+        std::cout << "Loaded " << Inputs.size() << " timesteps of training data\n";
+        std::cout << "Starting training for " << epochs << " epochs...\n";
+
+        for (int Epoch = 1; Epoch <= epochs; ++Epoch) {
+            double TrainLoss = RNN->TrainSequence(Inputs, Targets);
+
+            if (!std::isnan(TrainLoss) && !std::isinf(TrainLoss)) {
+                if (verbose || (Epoch % 10 == 0) || (Epoch == epochs)) {
+                    std::cout << "Epoch " << std::setw(4) << Epoch << "/"
+                              << epochs << " - Loss: "
+                              << std::fixed << std::setprecision(6) << TrainLoss << "\n";
+                }
+            }
+        }
+
+        std::cout << "Training completed.\n";
+        std::cout << "Saving trained model to: " << saveFile << "\n";
+        RNN->SaveModel(saveFile);
+
+        delete RNN;
+    }
+    else if (Command == cmdPredict) {
+        if (modelFile.empty()) { std::cerr << "Error: --model is required\n"; return 1; }
+        if (inputValues.empty()) { std::cerr << "Error: --input is required\n"; return 1; }
+
+        TRNNFacade* RNN = new TRNNFacade(1, {1}, 1, ctLSTM, atTanh, atLinear, ltMSE, 0.01, 5.0, 0);
+        RNN->LoadModel(modelFile);
+        if (RNN == nullptr) { std::cerr << "Error: Failed to load model\n"; return 1; }
+
+        TDArray2D Inputs(1);
+        Inputs[0] = inputValues;
+
+        TDArray2D Predictions = RNN->Predict(Inputs);
+
+        std::cout << "Input: ";
+        for (size_t i = 0; i < inputValues.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << std::fixed << std::setprecision(4) << inputValues[i];
+        }
+        std::cout << "\n";
+
+        if (!Predictions.empty() && !Predictions.back().empty()) {
+            std::cout << "Output: ";
+            for (size_t i = 0; i < Predictions.back().size(); ++i) {
+                if (i > 0) std::cout << ", ";
+                std::cout << std::fixed << std::setprecision(6) << Predictions.back()[i];
+            }
+            std::cout << "\n";
+
+            if (Predictions.back().size() > 1) {
+                size_t maxIdx = 0;
+                for (size_t i = 1; i < Predictions.back().size(); ++i) {
+                    if (Predictions.back()[i] > Predictions.back()[maxIdx]) {
+                        maxIdx = i;
+                    }
+                }
+                std::cout << "Max index: " << maxIdx << "\n";
+            }
+        }
+
+        delete RNN;
+    }
+    else if (Command == cmdInfo) {
+        if (modelFile.empty()) { std::cerr << "Error: --model is required\n"; return 1; }
+        std::cout << "Loading model from JSON: " << modelFile << "\n";
+        TRNNFacade* RNN = new TRNNFacade(1, {1}, 1, ctLSTM, atTanh, atLinear, ltMSE, 0.01, 5.0, 0);
+        RNN->LoadModel(modelFile);
         
-        if ((arg == "--help" || arg == "-h") && command == "create") {
-            ShowHelp(argv[0]);
-            return 0;
+        std::cout << "Model Information:\n";
+        std::cout << "  Input size: " << RNN->GetInputSize() << "\n";
+        std::cout << "  Output size: " << RNN->GetOutputSize() << "\n";
+        std::cout << "  Hidden sizes: ";
+        for (int i = 0; i < RNN->GetNumHiddenLayers(); ++i) {
+            if (i > 0) std::cout << ",";
+            std::cout << RNN->GetHiddenSize(i);
         }
-        else if (arg == "--input-size" && i + 1 < argc) {
-            InputSize = std::stoi(argv[++i]);
-        }
-        else if (arg == "--hidden-sizes" && i + 1 < argc) {
-            HiddenSizes = ParseHiddenSizes(argv[++i]);
-        }
-        else if (arg == "--output-size" && i + 1 < argc) {
-            OutputSize = std::stoi(argv[++i]);
-        }
-        else if (arg == "--cell-type" && i + 1 < argc) {
-            CellType = ParseCellType(argv[++i]);
-        }
-        else if (arg == "--activation" && i + 1 < argc) {
-            Activation = ParseActivation(argv[++i]);
-        }
-        else if (arg == "--output-activation" && i + 1 < argc) {
-            OutputActivation = ParseActivation(argv[++i]);
-        }
-        else if (arg == "--loss" && i + 1 < argc) {
-            LossType = ParseLossType(argv[++i]);
-        }
-        else if (arg == "--learning-rate" && i + 1 < argc) {
-            LearningRate = std::stod(argv[++i]);
-        }
-        else if (arg == "--gradient-clip" && i + 1 < argc) {
-            GradientClip = std::stod(argv[++i]);
-        }
-        else if (arg == "--bptt-steps" && i + 1 < argc) {
-            BPTTSteps = std::stoi(argv[++i]);
-        }
-        else if (arg == "--epochs" && i + 1 < argc) {
-            Epochs = std::stoi(argv[++i]);
-        }
-        else if (arg == "--input-file" && i + 1 < argc) {
-            InputFile = argv[++i];
-        }
-        else if (arg == "--target-file" && i + 1 < argc) {
-            TargetFile = argv[++i];
-        }
-        else if (arg == "--output-file" && i + 1 < argc) {
-            OutputFile = argv[++i];
-        }
-        else if (arg == "--model-file" && i + 1 < argc) {
-            ModelFile = argv[++i];
-        }
-        else if (arg == "--layer" && i + 1 < argc) {
-            LayerIdx = std::stoi(argv[++i]);
-        }
-        else if (arg == "--timestep" && i + 1 < argc) {
-            Timestep = std::stoi(argv[++i]);
-        }
-        else if (arg == "--neuron" && i + 1 < argc) {
-            NeuronIdx = std::stoi(argv[++i]);
-        }
-        else if (arg == "--output-idx" && i + 1 < argc) {
-            OutputIdx = std::stoi(argv[++i]);
-        }
-        else if (arg == "--value" && i + 1 < argc) {
-            Value = std::stod(argv[++i]);
-        }
-        else if (arg == "--gate" && i + 1 < argc) {
-            Gate = ParseGateType(argv[++i]);
-        }
-        else if (arg == "--threshold" && i + 1 < argc) {
-            Threshold = std::stod(argv[++i]);
-        }
+        std::cout << "\n";
+        std::cout << "  Cell type: " << CellTypeToStr(RNN->GetCellType()) << "\n";
+        std::cout << "  Hidden activation: tanh\n";
+        std::cout << "  Output activation: linear\n";
+        std::cout << "  Learning rate: " << std::fixed << std::setprecision(6) << RNN->GetLearningRate() << "\n";
+        std::cout << "  Gradient clip: " << std::fixed << std::setprecision(2) << RNN->GetGradientClip() << "\n";
+        std::cout << "  Dropout rate: " << std::fixed << std::setprecision(6) << RNN->GetDropoutRate() << "\n";
+        delete RNN;
     }
+    else if (Command == cmdQuery) {
+        if (modelFile.empty()) { std::cerr << "Error: --model is required\n"; return 1; }
+        if (queryType.empty()) { std::cerr << "Error: --query-type is required\n"; return 1; }
 
-    // Create RNN instance
-    TRNNFacadeOpenCL rnn(InputSize, HiddenSizes, OutputSize, CellType,
-                         Activation, OutputActivation, LossType, LearningRate,
-                         GradientClip, BPTTSteps, true);
+        std::cout << "Loading model from JSON: " << modelFile << "\n";
+        TRNNFacade* RNN = new TRNNFacade(1, {1}, 1, ctLSTM, atTanh, atLinear, ltMSE, 0.01, 5.0, 0);
+        RNN->LoadModel(modelFile);
 
-    // Execute command
-    if (command == "create") {
-        std::cout << "RNN Facade CLI (OpenCL GPU) - Matthew Abbott 2025" << std::endl;
-        std::cout << "Model created:" << std::endl;
-        std::cout << "  Input Size: " << InputSize << std::endl;
-        std::cout << "  Hidden Sizes: ";
-        for (int h : HiddenSizes) std::cout << h << " ";
-        std::cout << std::endl;
-        std::cout << "  Output Size: " << OutputSize << std::endl;
-        std::cout << "  Cell Type: " << (int)CellType << std::endl;
-        std::cout << "  GPU Available: " << (rnn.isGPUAvailable() ? "Yes" : "No") << std::endl;
-    }
-    else if (command == "info") {
-        std::cout << "GPU Information:" << std::endl;
-        std::cout << "  Available: " << (rnn.isGPUAvailable() ? "Yes" : "No") << std::endl;
-        std::cout << "  Layers: " << rnn.GetLayerCount() << std::endl;
-        std::cout << "  Cell Type: " << (int)rnn.GetCellType() << std::endl;
-        std::cout << "  Learning Rate: " << rnn.getLearningRate() << std::endl;
-    }
-    else if (command == "get-hidden") {
-        double val = rnn.GetHiddenValue(LayerIdx, Timestep, NeuronIdx);
-        std::cout << "Hidden[" << LayerIdx << "][" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
-    }
-    else if (command == "set-hidden") {
-        rnn.SetHiddenValue(LayerIdx, NeuronIdx, Value);
-        std::cout << "Set hidden[" << LayerIdx << "][" << NeuronIdx << "] = " << Value << std::endl;
-    }
-    else if (command == "get-output") {
-        double val = rnn.GetOutputValue(Timestep, OutputIdx);
-        std::cout << "Output[" << Timestep << "][" << OutputIdx << "] = " << val << std::endl;
-    }
-    else if (command == "get-cell-state") {
-        double val = rnn.GetCellState(LayerIdx, NeuronIdx);
-        std::cout << "CellState[" << LayerIdx << "][" << NeuronIdx << "] = " << val << std::endl;
-    }
-    else if (command == "get-gate") {
-        double val = rnn.GetGateValue(LayerIdx, Timestep, NeuronIdx, Gate);
-        std::cout << "Gate[" << LayerIdx << "][" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
-    }
-    else if (command == "get-preactivation") {
-        double val = rnn.GetPreactivation(LayerIdx, Timestep, NeuronIdx);
-        std::cout << "Preactivation[" << LayerIdx << "][" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
-    }
-    else if (command == "get-input") {
-        double val = rnn.GetInputValue(Timestep, NeuronIdx);
-        std::cout << "Input[" << Timestep << "][" << NeuronIdx << "] = " << val << std::endl;
-    }
-    else if (command == "reset-states") {
-        rnn.ResetAllStates(Value);
-        std::cout << "All states reset to " << Value << std::endl;
-    }
-    else if (command == "set-dropout") {
-        rnn.setDropoutRate(Value);
-        std::cout << "Dropout rate set to " << Value << std::endl;
-    }
-    else if (command == "get-dropout") {
-        std::cout << "Current dropout rate: " << rnn.getDropoutRate() << std::endl;
-    }
-    else if (command == "detect-vanishing") {
-        int count;
-        double minGrad;
-        rnn.DetectVanishingGradients(Threshold, count, minGrad);
-        std::cout << "Vanishing gradients detected: " << count << " values below " << Threshold << std::endl;
-        std::cout << "Minimum absolute gradient: " << minGrad << std::endl;
-    }
-    else if (command == "detect-exploding") {
-        int count;
-        double maxGrad;
-        rnn.DetectExplodingGradients(Threshold, count, maxGrad);
-        std::cout << "Exploding gradients detected: " << count << " values above " << Threshold << std::endl;
-        std::cout << "Maximum absolute gradient: " << maxGrad << std::endl;
-    }
-    else if (command == "get-seq-outputs") {
-        DArray2D outputs = rnn.GetSequenceOutputs();
-        std::cout << "Sequence outputs (" << outputs.size() << " timesteps, " 
-                  << (outputs.empty() ? 0 : outputs[0].size()) << " dimensions each):" << std::endl;
-        for (size_t t = 0; t < outputs.size(); t++) {
-            std::cout << "  T" << t << ": ";
-            for (double v : outputs[t]) std::cout << v << " ";
-            std::cout << std::endl;
-        }
-    }
-    else if (command == "get-seq-hidden") {
-        DArray2D states = rnn.GetSequenceHiddenStates(LayerIdx);
-        std::cout << "Hidden states for layer " << LayerIdx << " (" << states.size() 
-                  << " timesteps, " << (states.empty() ? 0 : states[0].size()) << " hidden units):" << std::endl;
-        for (size_t t = 0; t < states.size(); t++) {
-            std::cout << "  T" << t << ": ";
-            for (double v : states[t]) std::cout << v << " ";
-            std::cout << std::endl;
-        }
-    }
-    else if (command == "save") {
-        if (ModelFile.empty()) {
-            std::cerr << "Error: --model-file required for save command" << std::endl;
-            return 1;
-        }
-        if (rnn.SaveModel(ModelFile)) {
-            std::cout << "Model saved to " << ModelFile << std::endl;
+        std::cout << "Executing query: " << queryType << "\n\n";
+
+        if (queryType == "input-size") {
+            std::cout << "Input size: " << RNN->GetInputSize() << "\n";
+        } else if (queryType == "output-size") {
+            std::cout << "Output size: " << RNN->GetOutputSize() << "\n";
+        } else if (queryType == "hidden-size") {
+            std::cout << "Hidden size (layer " << layer << "): " << RNN->GetHiddenSize(layer) << "\n";
+        } else if (queryType == "cell-type") {
+            std::cout << "Cell type: " << CellTypeToStr(RNN->GetCellType()) << "\n";
+        } else if (queryType == "sequence-length") {
+            std::cout << "Sequence length: " << RNN->GetSequenceLength() << "\n";
+        } else if (queryType == "dropout-rate") {
+            std::cout << std::fixed << std::setprecision(6)
+                      << "Current dropout rate: " << RNN->GetDropoutRate() << "\n";
+        } else if (queryType == "hidden-state") {
+            std::cout << std::fixed << std::setprecision(6)
+                      << "Hidden state at [" << layer << "," << timestep << "," << neuron << "]: "
+                      << RNN->GetHiddenState(layer, timestep, neuron) << "\n";
         } else {
-            std::cerr << "Failed to save model" << std::endl;
-            return 1;
+            std::cout << "Unknown query type: " << queryType << "\n";
         }
-    }
-    else if (command == "load") {
-        if (ModelFile.empty()) {
-            std::cerr << "Error: --model-file required for load command" << std::endl;
-            return 1;
+
+        if (enableDropoutFlag) {
+            RNN->EnableDropout(true);
+            std::cout << "Dropout enabled\n";
         }
-        if (rnn.LoadModel(ModelFile)) {
-            std::cout << "Model loaded from " << ModelFile << std::endl;
-            std::cout << "Model architecture:" << std::endl;
-            std::cout << "  Input Size: " << InputSize << std::endl;
-            std::cout << "  Output Size: " << rnn.GetLayerCount() << " layers" << std::endl;
-        } else {
-            std::cerr << "Failed to load model" << std::endl;
-            return 1;
+
+        if (disableDropoutFlag) {
+            RNN->EnableDropout(false);
+            std::cout << "Dropout disabled\n";
         }
-    }
-    else {
-        std::cerr << "Unknown command: " << command << std::endl;
-        ShowHelp(argv[0]);
-        return 1;
+
+        if (dropoutValue > 0) {
+            RNN->SetDropoutRate(dropoutValue);
+            std::cout << std::fixed << std::setprecision(6)
+                      << "Dropout rate set to: " << dropoutValue << "\n";
+        }
+
+        delete RNN;
     }
 
     return 0;
