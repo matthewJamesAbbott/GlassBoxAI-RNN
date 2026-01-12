@@ -1,18 +1,38 @@
-//
-// Matthew Abbott  2025
-// Advanced RNN with BPTT, Gradient Clipping, LSTM/GRU, Batch Processing
-//
+/*
+ * MIT License
+ *
+ * Copyright (c) 2025 Matthew Abbott
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
 #include <iostream>
-#include <fstream>
-#include <sstream>
 #include <vector>
-#include <string>
 #include <cmath>
-#include <cstdlib>
-#include <ctime>
+#include <random>
+#include <string>
+#include <sstream>
+#include <fstream>
 #include <algorithm>
+#include <limits>
 #include <iomanip>
+#include <cstdio>
 #include <cuda_runtime.h>
 
 using namespace std;
@@ -47,15 +67,19 @@ __device__ double atomicAddDouble(double* address, double val) {
 }
 #endif
 
-// ========== Type Definitions ==========
+// ========== Type Aliases ==========
+using DArray = vector<double>;
+using TDArray2D = vector<DArray>;
+using TDArray3D = vector<TDArray2D>;
+using TIntArray = vector<int>;
+
+// ========== Enums ==========
 enum TActivationType { atSigmoid, atTanh, atReLU, atLinear };
 enum TLossType { ltMSE, ltCrossEntropy };
 enum TCellType { ctSimpleRNN, ctLSTM, ctGRU };
+enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp };
 
-typedef vector<double> DArray;
-typedef vector<DArray> TDArray2D;
-typedef vector<TDArray2D> TDArray3D;
-
+// ========== Data Structures ==========
 struct TDataSplit {
     TDArray2D TrainInputs, TrainTargets;
     TDArray2D ValInputs, ValTargets;
@@ -65,9 +89,10 @@ struct TTimeStepCache {
     DArray Input;
     DArray H, C;
     DArray PreH;
-    DArray Fg, Ig, CTilde, Og, TanhC;
+    DArray F, I, CTilde, O, TanhC;
     DArray Z, R, HTilde;
-    DArray OutPre, OutVal;
+    DArray OutVal, OutPre;
+    TDArray2D LayerInputs;
 };
 
 // ========== CUDA Kernels ==========
@@ -1002,6 +1027,15 @@ public:
     }
 };
 
+// ========== Forward Declarations ==========
+string CellTypeToStr(TCellType ct);
+string ActivationToStr(TActivationType act);
+string LossToStr(TLossType loss);
+TCellType ParseCellType(const string& s);
+TActivationType ParseActivation(const string& s);
+TLossType ParseLoss(const string& s);
+static string ExtractJSONValue(const string& json, const string& key);
+
 // ========== TAdvancedRNN ==========
 class TAdvancedRNN {
 public:
@@ -1113,10 +1147,10 @@ public:
                         NewStates[layer][1] = C;
                         Caches[t].H = H;
                         Caches[t].C = C;
-                        Caches[t].Fg = Fg;
-                        Caches[t].Ig = Ig;
+                        Caches[t].F = Fg;
+                        Caches[t].I = Ig;
                         Caches[t].CTilde = CTilde;
-                        Caches[t].Og = Og;
+                        Caches[t].O = Og;
                         Caches[t].TanhC = TanhC;
                         break;
                     case ctGRU:
@@ -1194,8 +1228,8 @@ public:
                                 dC[k] = dStatesC[layer][k];
 
                             FLSTMCells[layer]->Backward(dOut, dC, Caches[t].H, Caches[t].C,
-                                                         Caches[t].Fg, Caches[t].Ig, Caches[t].CTilde,
-                                                         Caches[t].Og, Caches[t].TanhC,
+                                                         Caches[t].F, Caches[t].I, Caches[t].CTilde,
+                                                         Caches[t].O, Caches[t].TanhC,
                                                          PrevH, PrevC, Caches[t].Input,
                                                          FGradientClip, dInput, dPrevH, dPrevC);
                             dStatesH[layer] = dPrevH;
@@ -1241,276 +1275,216 @@ public:
         return Result / Outputs.size();
     }
 
-    bool SaveModel(const string& FileName) {
-        try {
-            ofstream File(FileName, ios::binary);
-            if (!File.is_open()) {
-                cerr << "Error: Cannot open file for writing: " << FileName << endl;
-                return false;
-            }
-
-            // Write header and configuration
-            int NumLayers = FHiddenSizes.size();
-            int CellTypeInt = (int)FCellType;
-            int ActTypeInt = (int)FActivation;
-            int OutActTypeInt = (int)FOutputActivation;
-            int LossTypeInt = (int)FLossType;
-
-            File.write((char*)&FInputSize, sizeof(int));
-            File.write((char*)&FOutputSize, sizeof(int));
-            File.write((char*)&NumLayers, sizeof(int));
-            File.write((char*)&CellTypeInt, sizeof(int));
-            File.write((char*)&ActTypeInt, sizeof(int));
-            File.write((char*)&OutActTypeInt, sizeof(int));
-            File.write((char*)&LossTypeInt, sizeof(int));
-            File.write((char*)&FLearningRate, sizeof(double));
-            File.write((char*)&FGradientClip, sizeof(double));
-
-            // Write hidden sizes
-            for (int h : FHiddenSizes)
-                File.write((char*)&h, sizeof(int));
-
-            // Write SimpleRNN cells
-            for (auto cell : FSimpleCells) {
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < cell->FInputSize; j++) {
-                        File.write((char*)&cell->Wih[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < cell->FHiddenSize; j++) {
-                        File.write((char*)&cell->Whh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    File.write((char*)&cell->Bh[i], sizeof(double));
-                }
-            }
-
-            // Write LSTM cells
-            for (auto cell : FLSTMCells) {
-                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.write((char*)&cell->Wf[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.write((char*)&cell->Wi[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.write((char*)&cell->Wc[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.write((char*)&cell->Wo[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    File.write((char*)&cell->Bf[i], sizeof(double));
-                    File.write((char*)&cell->Bi[i], sizeof(double));
-                    File.write((char*)&cell->Bc[i], sizeof(double));
-                    File.write((char*)&cell->Bo[i], sizeof(double));
-                }
-            }
-
-            // Write GRU cells
-            for (auto cell : FGRUCells) {
-                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.write((char*)&cell->Wz[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.write((char*)&cell->Wr[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.write((char*)&cell->Wh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    File.write((char*)&cell->Bz[i], sizeof(double));
-                    File.write((char*)&cell->Br[i], sizeof(double));
-                    File.write((char*)&cell->Bh[i], sizeof(double));
-                }
-            }
-
-            // Write output layer
-            for (int i = 0; i < FOutputSize; i++) {
-                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
-                    File.write((char*)&FOutputLayer->W[i][j], sizeof(double));
-                }
-            }
-            for (int i = 0; i < FOutputSize; i++) {
-                File.write((char*)&FOutputLayer->B[i], sizeof(double));
-            }
-
-            File.close();
-            return true;
-        } catch (...) {
-            cerr << "Error saving model" << endl;
-            return false;
+    string Array1DToJSON(const DArray& Arr) {
+        string Result = "[";
+        for (size_t i = 0; i < Arr.size(); ++i) {
+            if (i > 0) Result += ",";
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.17g", Arr[i]);
+            Result += buf;
         }
+        Result += "]";
+        return Result;
     }
 
-    bool LoadModel(const string& FileName) {
-        try {
-            ifstream File(FileName, ios::binary);
-            if (!File.is_open()) {
-                cerr << "Error: File not found: " << FileName << endl;
-                return false;
-            }
-
-            int NumLayers, CellTypeInt, ActTypeInt, OutActTypeInt, LossTypeInt;
-            File.read((char*)&FInputSize, sizeof(int));
-            File.read((char*)&FOutputSize, sizeof(int));
-            File.read((char*)&NumLayers, sizeof(int));
-            File.read((char*)&CellTypeInt, sizeof(int));
-            File.read((char*)&ActTypeInt, sizeof(int));
-            File.read((char*)&OutActTypeInt, sizeof(int));
-            File.read((char*)&LossTypeInt, sizeof(int));
-            File.read((char*)&FLearningRate, sizeof(double));
-            File.read((char*)&FGradientClip, sizeof(double));
-
-            FCellType = (TCellType)CellTypeInt;
-            FActivation = (TActivationType)ActTypeInt;
-            FOutputActivation = (TActivationType)OutActTypeInt;
-            FLossType = (TLossType)LossTypeInt;
-
-            // Read hidden sizes
-            FHiddenSizes.clear();
-            for (int i = 0; i < NumLayers; i++) {
-                int h;
-                File.read((char*)&h, sizeof(int));
-                FHiddenSizes.push_back(h);
-            }
-
-            // Reinitialize cells based on loaded config
-            for (auto cell : FSimpleCells) delete cell;
-            for (auto cell : FLSTMCells) delete cell;
-            for (auto cell : FGRUCells) delete cell;
-            FSimpleCells.clear();
-            FLSTMCells.clear();
-            FGRUCells.clear();
-
-            if (FCellType == ctSimpleRNN) {
-                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
-                    FSimpleCells.push_back(new TSimpleRNNCell(InSize, FHiddenSizes[i], FActivation));
-                }
-            } else if (FCellType == ctLSTM) {
-                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
-                    FLSTMCells.push_back(new TLSTMCell(InSize, FHiddenSizes[i], FActivation));
-                }
-            } else if (FCellType == ctGRU) {
-                for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-                    int InSize = (i == 0) ? FInputSize : FHiddenSizes[i-1];
-                    FGRUCells.push_back(new TGRUCell(InSize, FHiddenSizes[i], FActivation));
-                }
-            }
-
-            if (FOutputLayer) delete FOutputLayer;
-            FOutputLayer = new TOutputLayer(FHiddenSizes.back(), FOutputSize, FOutputActivation);
-
-            // Read SimpleRNN cells
-            for (auto cell : FSimpleCells) {
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < cell->FInputSize; j++) {
-                        File.read((char*)&cell->Wih[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < cell->FHiddenSize; j++) {
-                        File.read((char*)&cell->Whh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    File.read((char*)&cell->Bh[i], sizeof(double));
-                }
-            }
-
-            // Read LSTM cells
-            for (auto cell : FLSTMCells) {
-                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.read((char*)&cell->Wf[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.read((char*)&cell->Wi[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.read((char*)&cell->Wc[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.read((char*)&cell->Wo[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    File.read((char*)&cell->Bf[i], sizeof(double));
-                    File.read((char*)&cell->Bi[i], sizeof(double));
-                    File.read((char*)&cell->Bc[i], sizeof(double));
-                    File.read((char*)&cell->Bo[i], sizeof(double));
-                }
-            }
-
-            // Read GRU cells
-            for (auto cell : FGRUCells) {
-                int InputPlusHidden = cell->FInputSize + cell->FHiddenSize;
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.read((char*)&cell->Wz[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.read((char*)&cell->Wr[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    for (int j = 0; j < InputPlusHidden; j++) {
-                        File.read((char*)&cell->Wh[i][j], sizeof(double));
-                    }
-                }
-                for (int i = 0; i < cell->FHiddenSize; i++) {
-                    File.read((char*)&cell->Bz[i], sizeof(double));
-                    File.read((char*)&cell->Br[i], sizeof(double));
-                    File.read((char*)&cell->Bh[i], sizeof(double));
-                }
-            }
-
-            // Read output layer
-            for (int i = 0; i < FOutputSize; i++) {
-                for (int j = 0; j < FOutputLayer->FInputSize; j++) {
-                    File.read((char*)&FOutputLayer->W[i][j], sizeof(double));
-                }
-            }
-            for (int i = 0; i < FOutputSize; i++) {
-                File.read((char*)&FOutputLayer->B[i], sizeof(double));
-            }
-
-            File.close();
-            FStates = InitHiddenStates();
-            return true;
-        } catch (...) {
-            cerr << "Error loading model" << endl;
-            return false;
+    string Array2DToJSON(const TDArray2D& Arr) {
+        string Result = "[";
+        for (size_t i = 0; i < Arr.size(); ++i) {
+            if (i > 0) Result += ",";
+            Result += Array1DToJSON(Arr[i]);
         }
+        Result += "]";
+        return Result;
+    }
+
+    void SaveModelToJSON(const string& Filename) {
+        ofstream file(Filename);
+        
+        file << "{\n";
+        file << "  \"input_size\": " << FInputSize << ",\n";
+        file << "  \"output_size\": " << FOutputSize << ",\n";
+        file << "  \"hidden_sizes\": [\n";
+        
+        for (size_t i = 0; i < FHiddenSizes.size(); ++i) {
+            if (i > 0) file << ",\n";
+            file << "    " << FHiddenSizes[i];
+        }
+        file << "\n  ],\n";
+        
+        file << "  \"cell_type\": \"" << CellTypeToStr(FCellType) << "\",\n";
+        file << "  \"activation\": \"" << ActivationToStr(FActivation) << "\",\n";
+        file << "  \"output_activation\": \"" << ActivationToStr(FOutputActivation) << "\",\n";
+        file << "  \"loss_type\": \"" << LossToStr(FLossType) << "\",\n";
+        file << fixed << setprecision(17);
+        file << "  \"learning_rate\": " << FLearningRate << ",\n";
+        file << "  \"gradient_clip\": " << FGradientClip << ",\n";
+        file << "  \"bptt_steps\": " << FBPTTSteps << ",\n";
+        file << "  \"dropout_rate\": 0,\n";
+        
+        file << "  \"cells\": [\n";
+        
+        switch (FCellType) {
+            case ctSimpleRNN:
+                for (size_t i = 0; i < FSimpleCells.size(); ++i) {
+                    if (i > 0) file << ",\n";
+                    file << "    {\n";
+                    file << "      \"Wih\": " << Array2DToJSON(FSimpleCells[i]->Wih) << ",\n";
+                    file << "      \"Whh\": " << Array2DToJSON(FSimpleCells[i]->Whh) << ",\n";
+                    file << "      \"bh\": " << Array1DToJSON(FSimpleCells[i]->Bh) << "\n";
+                    file << "    }";
+                }
+                break;
+            case ctLSTM:
+                for (size_t i = 0; i < FLSTMCells.size(); ++i) {
+                    if (i > 0) file << ",\n";
+                    file << "    {\n";
+                    file << "      \"Wf\": " << Array2DToJSON(FLSTMCells[i]->Wf) << ",\n";
+                    file << "      \"Wi\": " << Array2DToJSON(FLSTMCells[i]->Wi) << ",\n";
+                    file << "      \"Wc\": " << Array2DToJSON(FLSTMCells[i]->Wc) << ",\n";
+                    file << "      \"Wo\": " << Array2DToJSON(FLSTMCells[i]->Wo) << ",\n";
+                    file << "      \"Bf\": " << Array1DToJSON(FLSTMCells[i]->Bf) << ",\n";
+                    file << "      \"Bi\": " << Array1DToJSON(FLSTMCells[i]->Bi) << ",\n";
+                    file << "      \"Bc\": " << Array1DToJSON(FLSTMCells[i]->Bc) << ",\n";
+                    file << "      \"Bo\": " << Array1DToJSON(FLSTMCells[i]->Bo) << "\n";
+                    file << "    }";
+                }
+                break;
+            case ctGRU:
+                for (size_t i = 0; i < FGRUCells.size(); ++i) {
+                    if (i > 0) file << ",\n";
+                    file << "    {\n";
+                    file << "      \"Wz\": " << Array2DToJSON(FGRUCells[i]->Wz) << ",\n";
+                    file << "      \"Wr\": " << Array2DToJSON(FGRUCells[i]->Wr) << ",\n";
+                    file << "      \"Wh\": " << Array2DToJSON(FGRUCells[i]->Wh) << ",\n";
+                    file << "      \"Bz\": " << Array1DToJSON(FGRUCells[i]->Bz) << ",\n";
+                    file << "      \"Br\": " << Array1DToJSON(FGRUCells[i]->Br) << ",\n";
+                    file << "      \"Bh\": " << Array1DToJSON(FGRUCells[i]->Bh) << "\n";
+                    file << "    }";
+                }
+                break;
+        }
+        
+        file << "\n  ],\n";
+        
+        file << "  \"output_layer\": {\n";
+        file << "    \"W\": " << Array2DToJSON(FOutputLayer->W) << ",\n";
+        file << "    \"B\": " << Array1DToJSON(FOutputLayer->B) << "\n";
+        file << "  }\n";
+        file << "}\n";
+        
+        file.close();
+        cout << "Model saved to JSON: " << Filename << "\n";
+    }
+
+    void LoadModelFromJSON(const string& Filename) {
+        ifstream file(Filename);
+        if (!file.is_open()) {
+            cerr << "Error: Could not open file " << Filename << "\n";
+            return;
+        }
+        
+        stringstream buffer;
+        buffer << file.rdbuf();
+        string Content = buffer.str();
+        file.close();
+        
+        string inputStr = ExtractJSONValue(Content, "input_size");
+        if (inputStr.empty()) { cerr << "Error: Could not parse input_size from JSON\n"; return; }
+        int inputSize = stoi(inputStr);
+        
+        string outputStr = ExtractJSONValue(Content, "output_size");
+        if (outputStr.empty()) { cerr << "Error: Could not parse output_size from JSON\n"; return; }
+        int outputSize = stoi(outputStr);
+        
+        string cellTypeStr = ExtractJSONValue(Content, "cell_type");
+        TCellType cellType = ParseCellType(cellTypeStr);
+        
+        string hiddenStr = ExtractJSONValue(Content, "hidden_sizes");
+        
+        string activationStr = ExtractJSONValue(Content, "hidden_activation");
+        if (activationStr.empty()) activationStr = ExtractJSONValue(Content, "activation");
+        if (activationStr.empty()) activationStr = "tanh";
+        
+        string outputActStr = ExtractJSONValue(Content, "output_activation");
+        if (outputActStr.empty()) outputActStr = "linear";
+        
+        string lossStr = ExtractJSONValue(Content, "loss_type");
+        if (lossStr.empty()) lossStr = "mse";
+        
+        string lrStr = ExtractJSONValue(Content, "learning_rate");
+        double learningRate = lrStr.empty() ? 0.01 : stod(lrStr);
+        
+        string clipStr = ExtractJSONValue(Content, "gradient_clip");
+        double gradientClip = clipStr.empty() ? 5.0 : stod(clipStr);
+        
+        string bpttStr = ExtractJSONValue(Content, "bptt_steps");
+        int bpttSteps = bpttStr.empty() ? 0 : stoi(bpttStr);
+        
+        TIntArray hiddenSizes;
+        size_t openBracket = hiddenStr.find('[');
+        size_t closeBracket = hiddenStr.rfind(']');
+        if (openBracket != string::npos && closeBracket != string::npos) {
+            string arrayContent = hiddenStr.substr(openBracket + 1, closeBracket - openBracket - 1);
+            stringstream ss(arrayContent);
+            string token;
+            while (getline(ss, token, ',')) {
+                size_t start = token.find_first_not_of(" \t\n\r");
+                size_t end = token.find_last_not_of(" \t\n\r");
+                if (start != string::npos && end != string::npos) {
+                    token = token.substr(start, end - start + 1);
+                    if (!token.empty()) {
+                        hiddenSizes.push_back(stoi(token));
+                    }
+                }
+            }
+        } else if (!hiddenStr.empty()) {
+            hiddenSizes.push_back(stoi(hiddenStr));
+        }
+        
+        FInputSize = inputSize;
+        FOutputSize = outputSize;
+        FHiddenSizes = hiddenSizes;
+        FCellType = cellType;
+        FActivation = ParseActivation(activationStr);
+        FOutputActivation = ParseActivation(outputActStr);
+        FLossType = ParseLoss(lossStr);
+        FLearningRate = learningRate;
+        FGradientClip = gradientClip;
+        FBPTTSteps = bpttSteps;
+        
+        for (auto cell : FSimpleCells) delete cell;
+        for (auto cell : FLSTMCells) delete cell;
+        for (auto cell : FGRUCells) delete cell;
+        FSimpleCells.clear();
+        FLSTMCells.clear();
+        FGRUCells.clear();
+        if (FOutputLayer) delete FOutputLayer;
+        
+        int PrevSize = inputSize;
+        switch (cellType) {
+            case ctSimpleRNN:
+                for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+                    FSimpleCells.push_back(new TSimpleRNNCell(PrevSize, hiddenSizes[i], FActivation));
+                    PrevSize = hiddenSizes[i];
+                }
+                break;
+            case ctLSTM:
+                for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+                    FLSTMCells.push_back(new TLSTMCell(PrevSize, hiddenSizes[i], FActivation));
+                    PrevSize = hiddenSizes[i];
+                }
+                break;
+            case ctGRU:
+                for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+                    FGRUCells.push_back(new TGRUCell(PrevSize, hiddenSizes[i], FActivation));
+                    PrevSize = hiddenSizes[i];
+                }
+                break;
+        }
+        
+        FOutputLayer = new TOutputLayer(PrevSize, outputSize, FOutputActivation);
+        
+        cout << "Model loaded from JSON: " << Filename << "\n";
     }
 
     void ResetGradients() {
@@ -1575,346 +1549,467 @@ void SplitData(const TDArray2D& Inputs, const TDArray2D& Targets, double ValSpli
     }
 }
 
-// ========== CLI Helpers ==========
-void ShowHelp() {
-    cout << "RNN CUDA" << endl;
-    cout << "Advanced RNN with BPTT, Gradient Clipping, LSTM/GRU, Batch Processing" << endl;
-    cout << endl;
-    cout << "Usage: rnn_cuda [OPTIONS]" << endl;
-    cout << endl;
-    cout << "Training an RNN on sequence data from CSV files (CUDA accelerated)." << endl;
-    cout << endl;
-    cout << "Options:" << endl;
-    cout << "  -h, --help              Show this help message and exit" << endl;
-    cout << "  -i, --input FILE        Input CSV file (required for train/predict)" << endl;
-    cout << "  -t, --target FILE       Target CSV file (required for train)" << endl;
-    cout << "  -o, --output FILE       Output predictions to FILE" << endl;
-    cout << "  -m, --model FILE        Model file to save/load" << endl;
-    cout << endl;
-    cout << "Model Architecture:" << endl;
-    cout << "  --cell TYPE             Cell type: rnn, lstm, gru (default: lstm)" << endl;
-    cout << "  --hidden SIZE           Hidden layer size (default: 32)" << endl;
-    cout << "  --layers N              Number of hidden layers (default: 1)" << endl;
-    cout << "  --activation TYPE       Hidden activation: sigmoid, tanh, relu (default: tanh)" << endl;
-    cout << "  --out-activation TYPE   Output activation: sigmoid, tanh, relu, linear (default: linear)" << endl;
-    cout << endl;
-    cout << "Training Parameters:" << endl;
-    cout << "  --epochs N              Number of training epochs (default: 100)" << endl;
-    cout << "  --lr RATE               Learning rate (default: 0.01)" << endl;
-    cout << "  --clip VALUE            Gradient clipping value (default: 5.0)" << endl;
-    cout << "  --val-split RATIO       Validation split ratio (default: 0.2)" << endl;
-    cout << "  --loss TYPE             Loss function: mse, crossentropy (default: mse)" << endl;
-    cout << "  --log-interval N        Log every N epochs (default: 10)" << endl;
-    cout << "  --seed N                Random seed (default: random)" << endl;
-    cout << endl;
-    cout << "Inference:" << endl;
-    cout << "  --predict               Predict mode (requires --input and --model)" << endl;
-    cout << endl;
-    cout << "Miscellaneous:" << endl;
-    cout << "  --quiet                 Suppress progress output" << endl;
-    cout << endl;
-    cout << "Examples:" << endl;
-    cout << "  rnn_cuda --input data.csv --target labels.csv --epochs 200 -m model.bin" << endl;
-    cout << "  rnn_cuda --predict --input test.csv -m model.bin --output predictions.csv" << endl;
-    cout << endl;
-}
-
-string GetArg(int argc, char* argv[], const string& Name) {
-    for (int i = 1; i < argc - 1; i++)
-        if (string(argv[i]) == Name)
-            return string(argv[i + 1]);
-    return "";
-}
-
-bool HasArg(int argc, char* argv[], const string& Name) {
-    for (int i = 1; i < argc; i++)
-        if (string(argv[i]) == Name)
-            return true;
-    return false;
-}
-
-int GetArgInt(int argc, char* argv[], const string& Name, int Default) {
-    string S = GetArg(argc, argv, Name);
-    if (S.empty()) return Default;
-    return atoi(S.c_str());
-}
-
-double GetArgFloat(int argc, char* argv[], const string& Name, double Default) {
-    string S = GetArg(argc, argv, Name);
-    if (S.empty()) return Default;
-    return atof(S.c_str());
-}
-
-TCellType ParseCellType(const string& S) {
-    if (S == "rnn" || S == "simple") return ctSimpleRNN;
-    else if (S == "gru") return ctGRU;
-    else return ctLSTM;
-}
-
-TActivationType ParseActivation(const string& S) {
-    if (S == "sigmoid") return atSigmoid;
-    else if (S == "relu") return atReLU;
-    else if (S == "linear") return atLinear;
-    else return atTanh;
-}
-
-TLossType ParseLoss(const string& S) {
-    if (S == "crossentropy") return ltCrossEntropy;
-    else return ltMSE;
-}
-
-string CellTypeToStr(TCellType CT) {
-    switch (CT) {
-        case ctSimpleRNN: return "SimpleRNN";
-        case ctLSTM: return "LSTM";
-        case ctGRU: return "GRU";
-        default: return "Unknown";
+// ========== Helper Functions ==========
+string CellTypeToStr(TCellType ct) {
+    switch (ct) {
+        case ctSimpleRNN: return "simplernn";
+        case ctLSTM: return "lstm";
+        case ctGRU: return "gru";
+        default: return "simplernn";
     }
 }
 
-TDArray2D LoadCSV(const string& FileName) {
-    TDArray2D Result;
-    ifstream F(FileName);
-    if (!F.is_open()) {
-        cerr << "Error: File not found: " << FileName << endl;
-        exit(1);
+string ActivationToStr(TActivationType act) {
+    switch (act) {
+        case atSigmoid: return "sigmoid";
+        case atTanh: return "tanh";
+        case atReLU: return "relu";
+        case atLinear: return "linear";
+        default: return "sigmoid";
     }
+}
 
-    string Line;
-    while (getline(F, Line)) {
-        if (Line.empty()) continue;
+string LossToStr(TLossType loss) {
+    switch (loss) {
+        case ltMSE: return "mse";
+        case ltCrossEntropy: return "crossentropy";
+        default: return "mse";
+    }
+}
 
-        DArray Row;
-        stringstream SS(Line);
-        string Token;
-        while (getline(SS, Token, ',')) {
-            double Val = atof(Token.c_str());
-            Row.push_back(Val);
+TCellType ParseCellType(const string& s) {
+    string lower = s;
+    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "lstm") return ctLSTM;
+    if (lower == "gru") return ctGRU;
+    return ctSimpleRNN;
+}
+
+TActivationType ParseActivation(const string& s) {
+    string lower = s;
+    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "tanh") return atTanh;
+    if (lower == "relu") return atReLU;
+    if (lower == "linear") return atLinear;
+    return atSigmoid;
+}
+
+TLossType ParseLoss(const string& s) {
+    string lower = s;
+    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "crossentropy") return ltCrossEntropy;
+    return ltMSE;
+}
+
+void ParseIntArrayHelper(const string& s, TIntArray& result) {
+    result.clear();
+    stringstream ss(s);
+    string token;
+    while (getline(ss, token, ',')) {
+        token.erase(0, token.find_first_not_of(" \t\r\n"));
+        token.erase(token.find_last_not_of(" \t\r\n") + 1);
+        result.push_back(stoi(token));
+    }
+}
+
+void ParseDoubleArrayHelper(const string& s, DArray& result) {
+    result.clear();
+    stringstream ss(s);
+    string token;
+    while (getline(ss, token, ',')) {
+        token.erase(0, token.find_first_not_of(" \t\r\n"));
+        token.erase(token.find_last_not_of(" \t\r\n") + 1);
+        result.push_back(stod(token));
+    }
+}
+
+void LoadDataFromCSV(const string& Filename, TDArray2D& Inputs, TDArray2D& Targets) {
+    Inputs.clear();
+    Targets.clear();
+    
+    ifstream file(Filename);
+    string line;
+    
+    while (getline(file, line)) {
+        if (line.empty()) continue;
+        
+        DArray InputsArr, TargetsArr;
+        stringstream ss(line);
+        string token;
+        
+        vector<double> tokens;
+        while (getline(ss, token, ',')) {
+            token.erase(0, token.find_first_not_of(" \t\r\n"));
+            token.erase(token.find_last_not_of(" \t\r\n") + 1);
+            tokens.push_back(stod(token));
         }
-
-        if (!Row.empty())
-            Result.push_back(Row);
-    }
-
-    F.close();
-    return Result;
-}
-
-void SaveCSV(const string& FileName, const TDArray2D& Data) {
-    ofstream F(FileName);
-    for (size_t i = 0; i < Data.size(); i++) {
-        for (size_t j = 0; j < Data[i].size(); j++) {
-            if (j > 0) F << ",";
-            F << fixed << setprecision(6) << Data[i][j];
+        
+        if (tokens.size() >= 2) {
+            size_t splitPoint = tokens.size() / 2;
+            InputsArr.assign(tokens.begin(), tokens.begin() + splitPoint);
+            TargetsArr.assign(tokens.begin() + splitPoint, tokens.end());
+            
+            Inputs.push_back(InputsArr);
+            Targets.push_back(TargetsArr);
         }
-        F << endl;
     }
-    F.close();
+    
+    file.close();
 }
 
-// ========== Main ==========
+static string ExtractJSONValue(const string& json, const string& key) {
+     string searchKey = "\"" + key + "\"";
+     size_t keyPos = json.find(searchKey);
+     
+     if (keyPos == string::npos) return "";
+     
+     size_t colonPos = json.find(':', keyPos);
+     if (colonPos == string::npos) return "";
+     
+     size_t startPos = colonPos + 1;
+     
+     while (startPos < json.length() && (json[startPos] == ' ' || json[startPos] == '\t' 
+            || json[startPos] == '\n' || json[startPos] == '\r')) {
+         ++startPos;
+     }
+     
+     if (startPos < json.length() && json[startPos] == '"') {
+         size_t quotePos1 = startPos;
+         size_t quotePos2 = json.find('"', quotePos1 + 1);
+         if (quotePos2 != string::npos) {
+             return json.substr(quotePos1 + 1, quotePos2 - quotePos1 - 1);
+         }
+         return "";
+     }
+     
+     if (startPos < json.length() && json[startPos] == '[') {
+         size_t bracketCount = 1;
+         size_t endPos = startPos + 1;
+         while (endPos < json.length() && bracketCount > 0) {
+             if (json[endPos] == '[') bracketCount++;
+             else if (json[endPos] == ']') bracketCount--;
+             if (bracketCount > 0) endPos++;
+         }
+         return json.substr(startPos, endPos - startPos + 1);
+     }
+     
+     size_t endPos = json.find(',', startPos);
+     if (endPos == string::npos) endPos = json.find('}', startPos);
+     if (endPos == string::npos) endPos = json.find(']', startPos);
+     
+     string result = json.substr(startPos, endPos - startPos);
+     size_t end = result.find_last_not_of(" \t\n\r");
+     if (end != string::npos) {
+         result = result.substr(0, end + 1);
+     }
+     return result;
+ }
+
+// ========== Utility Functions ==========
+void PrintUsage() {
+    cout << "RNN (CUDA Accelerated)\n\n";
+    cout << "Commands:\n";
+    cout << "  create   Create a new RNN model and save to JSON\n";
+    cout << "  train    Train an existing model with data from JSON\n";
+    cout << "  predict  Make predictions with a trained model from JSON\n";
+    cout << "  info     Display model information from JSON\n";
+    cout << "  help     Show this help message\n\n";
+    cout << "Create Options:\n";
+    cout << "  --input=N              Input layer size (required)\n";
+    cout << "  --hidden=N,N,...       Hidden layer sizes (required)\n";
+    cout << "  --output=N             Output layer size (required)\n";
+    cout << "  --save=FILE.json       Save model to JSON file (required)\n";
+    cout << "  --cell=TYPE            simplernn|lstm|gru (default: lstm)\n";
+    cout << "  --lr=VALUE             Learning rate (default: 0.01)\n";
+    cout << "  --hidden-act=TYPE      sigmoid|tanh|relu|linear (default: tanh)\n";
+    cout << "  --output-act=TYPE      sigmoid|tanh|relu|linear (default: linear)\n";
+    cout << "  --loss=TYPE            mse|crossentropy (default: mse)\n";
+    cout << "  --clip=VALUE           Gradient clipping (default: 5.0)\n";
+    cout << "  --bptt=N               BPTT steps (default: 0 = full)\n\n";
+    cout << "Train Options:\n";
+    cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    cout << "  --data=FILE.csv        Training data CSV file (required)\n";
+    cout << "  --save=FILE.json       Save trained model to JSON (required)\n";
+    cout << "  --epochs=N             Number of training epochs (default: 100)\n";
+    cout << "  --batch=N              Batch size (default: 1)\n";
+    cout << "  --lr=VALUE             Override learning rate\n";
+    cout << "  --seq-len=N            Sequence length (default: auto-detect)\n\n";
+    cout << "Predict Options:\n";
+    cout << "  --model=FILE.json      Load model from JSON file (required)\n";
+    cout << "  --input=v1,v2,...      Input values as CSV (required)\n\n";
+    cout << "Info Options:\n";
+    cout << "  --model=FILE.json      Load model from JSON file (required)\n\n";
+    cout << "Options:\n";
+    cout << "  --input       Input size (create) or input values (predict)\n";
+    cout << "  --hidden      Hidden layer sizes (comma-separated)\n";
+    cout << "  --output      Output size\n";
+    cout << "  --cell        Cell type: simplernn, lstm, gru (default: lstm)\n";
+    cout << "  --hidden-act  Hidden activation: sigmoid, tanh, relu, linear (default: tanh)\n";
+    cout << "  --output-act  Output activation: sigmoid, tanh, relu, linear (default: linear)\n";
+    cout << "  --loss        Loss function: mse, crossentropy (default: mse)\n";
+    cout << "  --lr          Learning rate (default: 0.01)\n";
+    cout << "  --clip        Gradient clipping value (default: 5.0)\n";
+    cout << "  --bptt        BPTT steps (default: 0 = full sequence)\n";
+    cout << "  --epochs      Training epochs (default: 100)\n";
+    cout << "  --batch       Batch size (default: 1)\n";
+    cout << "  --model       Model file path\n";
+    cout << "  --data        Data file path\n";
+    cout << "  --save        Save file path\n";
+    cout << "  --verbose     Verbose output\n";
+}
+
+// ========== Main Program ==========
 int main(int argc, char* argv[]) {
-    if (argc == 1 || HasArg(argc, argv, "-h") || HasArg(argc, argv, "--help")) {
-        ShowHelp();
+    if (argc < 2) {
+        PrintUsage();
+        return 1;
+    }
+
+    string CmdStr = argv[1];
+    TCommand Command = cmdNone;
+
+    if (CmdStr == "create") Command = cmdCreate;
+    else if (CmdStr == "train") Command = cmdTrain;
+    else if (CmdStr == "predict") Command = cmdPredict;
+    else if (CmdStr == "info") Command = cmdInfo;
+    else if (CmdStr == "help" || CmdStr == "--help" || CmdStr == "-h") Command = cmdHelp;
+    else {
+        cerr << "Unknown command: " << CmdStr << "\n";
+        PrintUsage();
+        return 1;
+    }
+
+    if (Command == cmdHelp) {
+        PrintUsage();
         return 0;
     }
 
-    // Check CUDA device
     int deviceCount = 0;
     cudaGetDeviceCount(&deviceCount);
     if (deviceCount == 0) {
-        cerr << "Error: No CUDA devices found" << endl;
+        cerr << "Error: No CUDA devices found\n";
         return 1;
     }
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    cout << "Using CUDA device: " << prop.name << endl;
+    cout << "Using CUDA device: " << prop.name << "\n";
 
-    string InputFile = GetArg(argc, argv, "-i");
-    if (InputFile.empty()) InputFile = GetArg(argc, argv, "--input");
-    string TargetFile = GetArg(argc, argv, "-t");
-    if (TargetFile.empty()) TargetFile = GetArg(argc, argv, "--target");
-    string ModelFile = GetArg(argc, argv, "-m");
-    if (ModelFile.empty()) ModelFile = GetArg(argc, argv, "--model");
-    string OutputFile = GetArg(argc, argv, "-o");
-    if (OutputFile.empty()) OutputFile = GetArg(argc, argv, "--output");
+    int inputSize = 0;
+    int outputSize = 0;
+    TIntArray hiddenSizes;
+    double learningRate = 0.01;
+    double gradientClip = 5.0;
+    int epochs = 100;
+    int batchSize = 1;
+    int seqLen = 0;
+    int bpttSteps = 0;
+    bool verbose = false;
+    TActivationType hiddenAct = atTanh;
+    TActivationType outputAct = atLinear;
+    TCellType cellType = ctLSTM;
+    TLossType lossType = ltMSE;
+    string modelFile, saveFile, dataFile;
+    DArray inputValues;
 
-    TCellType CellType = ParseCellType(GetArg(argc, argv, "--cell"));
-    int HiddenSize = GetArgInt(argc, argv, "--hidden", 32);
-    int NumLayers = GetArgInt(argc, argv, "--layers", 1);
-    int Epochs = GetArgInt(argc, argv, "--epochs", 100);
-    double LearningRate = GetArgFloat(argc, argv, "--lr", 0.01);
-    double GradClip = GetArgFloat(argc, argv, "--clip", 5.0);
-    double ValSplit = GetArgFloat(argc, argv, "--val-split", 0.2);
-    int LogInterval = GetArgInt(argc, argv, "--log-interval", 10);
-    TActivationType Activation = ParseActivation(GetArg(argc, argv, "--activation"));
-    TActivationType OutActivation = ParseActivation(GetArg(argc, argv, "--out-activation"));
-    if (GetArg(argc, argv, "--out-activation").empty()) OutActivation = atLinear;
-    TLossType LossType = ParseLoss(GetArg(argc, argv, "--loss"));
-    bool PredictMode = HasArg(argc, argv, "--predict");
-    bool Quiet = HasArg(argc, argv, "--quiet");
-    int Seed = GetArgInt(argc, argv, "--seed", -1);
+    for (int i = 2; i < argc; ++i) {
+        string arg = argv[i];
 
-    if (Seed >= 0)
-        srand(Seed);
-    else
-        srand(time(NULL));
+        if (arg == "--verbose") {
+            verbose = true;
+        } else {
+            size_t eqPos = arg.find('=');
+            if (eqPos == string::npos) {
+                cerr << "Invalid argument: " << arg << "\n";
+                continue;
+            }
 
-    vector<int> HiddenSizes(NumLayers, HiddenSize);
+            string key = arg.substr(0, eqPos);
+            string value = arg.substr(eqPos + 1);
 
-    if (InputFile.empty()) {
-        cerr << "Error: --input is required" << endl;
-        return 1;
+            if (key == "--input") {
+                if (Command == cmdPredict) {
+                    ParseDoubleArrayHelper(value, inputValues);
+                } else {
+                    inputSize = stoi(value);
+                }
+            } else if (key == "--hidden") {
+                ParseIntArrayHelper(value, hiddenSizes);
+            } else if (key == "--output") {
+                outputSize = stoi(value);
+            } else if (key == "--save") {
+                saveFile = value;
+            } else if (key == "--model") {
+                modelFile = value;
+            } else if (key == "--data") {
+                dataFile = value;
+            } else if (key == "--lr") {
+                learningRate = stod(value);
+            } else if (key == "--cell") {
+                cellType = ParseCellType(value);
+            } else if (key == "--hidden-act") {
+                hiddenAct = ParseActivation(value);
+            } else if (key == "--output-act") {
+                outputAct = ParseActivation(value);
+            } else if (key == "--loss") {
+                lossType = ParseLoss(value);
+            } else if (key == "--clip") {
+                gradientClip = stod(value);
+            } else if (key == "--bptt") {
+                bpttSteps = stoi(value);
+            } else if (key == "--epochs") {
+                epochs = stoi(value);
+            } else if (key == "--batch") {
+                batchSize = stoi(value);
+            } else if (key == "--seq-len") {
+                seqLen = stoi(value);
+            } else {
+                cerr << "Unknown option: " << key << "\n";
+            }
+        }
     }
 
-    TDArray2D Inputs = LoadCSV(InputFile);
-    int InputSize = Inputs[0].size();
+    if (Command == cmdCreate) {
+        if (inputSize <= 0) { cerr << "Error: --input is required\n"; return 1; }
+        if (hiddenSizes.empty()) { cerr << "Error: --hidden is required\n"; return 1; }
+        if (outputSize <= 0) { cerr << "Error: --output is required\n"; return 1; }
+        if (saveFile.empty()) { cerr << "Error: --save is required\n"; return 1; }
 
-    if (PredictMode) {
-        if (ModelFile.empty()) {
-            cerr << "Error: --model is required for prediction" << endl;
+        TAdvancedRNN* RNNModel = new TAdvancedRNN(inputSize, hiddenSizes, outputSize, cellType,
+                                   hiddenAct, outputAct, lossType, learningRate,
+                                   gradientClip, bpttSteps);
+
+        cout << "Created RNN model:\n";
+        cout << "  Input size: " << inputSize << "\n";
+        cout << "  Hidden sizes: ";
+        for (size_t i = 0; i < hiddenSizes.size(); ++i) {
+            if (i > 0) cout << ",";
+            cout << hiddenSizes[i];
+        }
+        cout << "\n";
+        cout << "  Output size: " << outputSize << "\n";
+        cout << "  Cell type: " << CellTypeToStr(cellType) << "\n";
+        cout << "  Hidden activation: " << ActivationToStr(hiddenAct) << "\n";
+        cout << "  Output activation: " << ActivationToStr(outputAct) << "\n";
+        cout << "  Loss function: " << LossToStr(lossType) << "\n";
+        cout << fixed << setprecision(6)
+                  << "  Learning rate: " << learningRate << "\n";
+        cout << fixed << setprecision(2)
+                  << "  Gradient clip: " << gradientClip << "\n";
+        cout << "  BPTT steps: " << bpttSteps << "\n";
+
+        RNNModel->SaveModelToJSON(saveFile);
+        cout << "Model saved to: " << saveFile << "\n";
+
+        delete RNNModel;
+    }
+    else if (Command == cmdTrain) {
+        if (modelFile.empty()) { cerr << "Error: --model is required\n"; return 1; }
+        if (dataFile.empty()) { cerr << "Error: --data is required\n"; return 1; }
+        if (saveFile.empty()) { cerr << "Error: --save is required\n"; return 1; }
+
+        cout << "Loading model from JSON: " << modelFile << "\n";
+        TAdvancedRNN* RNNModel = new TAdvancedRNN(1, {1}, 1, ctLSTM, atTanh, atLinear, ltMSE, 0.01, 5.0, 0);
+        RNNModel->LoadModelFromJSON(modelFile);
+        cout << "Model loaded successfully.\n";
+
+        cout << "Loading training data from: " << dataFile << "\n";
+        TDArray2D Inputs, Targets;
+        LoadDataFromCSV(dataFile, Inputs, Targets);
+
+        if (Inputs.empty()) {
+            cerr << "Error: No data loaded from CSV file\n";
+            delete RNNModel;
             return 1;
         }
 
-        TAdvancedRNN* RNN = new TAdvancedRNN(
-            InputSize,
-            HiddenSizes,
-            10,  // dummy output size, will be overwritten by LoadModel
-            CellType,
-            Activation,
-            OutActivation,
-            LossType,
-            LearningRate,
-            GradClip,
-            0
-        );
+        cout << "Loaded " << Inputs.size() << " timesteps of training data\n";
+        cout << "Starting training for " << epochs << " epochs...\n";
 
-        if (!RNN->LoadModel(ModelFile)) {
-            cerr << "Error: Failed to load model from " << ModelFile << endl;
-            delete RNN;
-            return 1;
-        }
+        for (int Epoch = 1; Epoch <= epochs; ++Epoch) {
+            double TrainLoss = RNNModel->TrainSequence(Inputs, Targets);
 
-        if (!Quiet)
-            cout << "Model loaded from: " << ModelFile << endl;
-
-        TDArray2D Predictions = RNN->Predict(Inputs);
-        if (!OutputFile.empty()) {
-            SaveCSV(OutputFile, Predictions);
-            if (!Quiet)
-                cout << "Predictions saved to: " << OutputFile << endl;
-        }
-
-        if (!Quiet) {
-            cout << "Predictions:" << endl;
-            for (size_t i = 0; i < Predictions.size() && i < 10; i++) {
-                cout << "  Sample " << i << ": ";
-                for (size_t j = 0; j < Predictions[i].size(); j++) {
-                    cout << fixed << setprecision(6) << Predictions[i][j] << " ";
-                }
-                cout << endl;
-            }
-        }
-
-        delete RNN;
-    } else {
-        if (TargetFile.empty()) {
-            cerr << "Error: --target is required for training" << endl;
-            return 1;
-        }
-
-        TDArray2D Targets = LoadCSV(TargetFile);
-        int OutputSize = Targets[0].size();
-
-        if (Inputs.size() != Targets.size()) {
-            cerr << "Error: Input and target row counts do not match" << endl;
-            return 1;
-        }
-
-        TDataSplit Split;
-        SplitData(Inputs, Targets, ValSplit, Split);
-
-        TAdvancedRNN* RNN = new TAdvancedRNN(
-            InputSize,
-            HiddenSizes,
-            OutputSize,
-            CellType,
-            Activation,
-            OutActivation,
-            LossType,
-            LearningRate,
-            GradClip,
-            0
-        );
-
-        if (!Quiet) {
-            cout << "=== RNN Training (CUDA) ===" << endl;
-            cout << "Cell Type:     " << CellTypeToStr(CellType) << endl;
-            cout << "Hidden Size:   " << HiddenSize << endl;
-            cout << "Layers:        " << NumLayers << endl;
-            cout << "Input Size:    " << InputSize << endl;
-            cout << "Output Size:   " << OutputSize << endl;
-            cout << fixed << setprecision(4);
-            cout << "Learning Rate: " << LearningRate << endl;
-            cout << setprecision(2);
-            cout << "Gradient Clip: " << GradClip << endl;
-            cout << "Train samples: " << Split.TrainInputs.size() << endl;
-            cout << "Val samples:   " << Split.ValInputs.size() << endl;
-            cout << endl;
-            cout << "Epoch | Train Loss | Val Loss" << endl;
-            cout << "------+------------+-----------" << endl;
-        }
-
-        for (int Epoch = 1; Epoch <= Epochs; Epoch++) {
-            double TrainLoss = 0;
-            for (size_t b = 0; b < Split.TrainInputs.size(); b++) {
-                TDArray2D SingleInput = { Split.TrainInputs[b] };
-                TDArray2D SingleTarget = { Split.TrainTargets[b] };
-                TrainLoss += RNN->TrainSequence(SingleInput, SingleTarget);
-            }
-            TrainLoss /= Split.TrainInputs.size();
-
-            double ValLoss = 0;
-            if (!Split.ValInputs.empty()) {
-                for (size_t b = 0; b < Split.ValInputs.size(); b++) {
-                    TDArray2D SingleInput = { Split.ValInputs[b] };
-                    TDArray2D SingleTarget = { Split.ValTargets[b] };
-                    ValLoss += RNN->ComputeLoss(SingleInput, SingleTarget);
-                }
-                ValLoss /= Split.ValInputs.size();
-            }
-
-            if (!Quiet) {
-                if (Epoch % LogInterval == 0 || Epoch == Epochs) {
-                    cout << setw(5) << Epoch << " | "
-                         << fixed << setprecision(6) << setw(10) << TrainLoss << " | "
-                         << setw(10) << ValLoss << endl;
+            if (!isnan(TrainLoss) && !isinf(TrainLoss)) {
+                if (verbose || (Epoch % 10 == 0) || (Epoch == epochs)) {
+                    cout << "Epoch " << setw(4) << Epoch << "/"
+                              << epochs << " - Loss: "
+                              << fixed << setprecision(6) << TrainLoss << "\n";
                 }
             }
         }
 
-        if (!OutputFile.empty()) {
-            TDArray2D Predictions = RNN->Predict(Inputs);
-            SaveCSV(OutputFile, Predictions);
-            if (!Quiet)
-                cout << "Predictions saved to: " << OutputFile << endl;
-        }
+        cout << "Training completed.\n";
+        cout << "Saving trained model to: " << saveFile << "\n";
+        RNNModel->SaveModelToJSON(saveFile);
 
-        if (!ModelFile.empty()) {
-            if (RNN->SaveModel(ModelFile)) {
-                if (!Quiet)
-                    cout << "Model saved to: " << ModelFile << endl;
-            } else {
-                if (!Quiet)
-                    cerr << "Warning: Failed to save model to " << ModelFile << endl;
+        delete RNNModel;
+    }
+    else if (Command == cmdPredict) {
+        if (modelFile.empty()) { cerr << "Error: --model is required\n"; return 1; }
+        if (inputValues.empty()) { cerr << "Error: --input is required\n"; return 1; }
+
+        TAdvancedRNN* RNNModel = new TAdvancedRNN(1, {1}, 1, ctLSTM, atTanh, atLinear, ltMSE, 0.01, 5.0, 0);
+        RNNModel->LoadModelFromJSON(modelFile);
+        if (RNNModel == nullptr) { cerr << "Error: Failed to load model\n"; return 1; }
+
+        TDArray2D Inputs(1);
+        Inputs[0] = inputValues;
+
+        TDArray2D Predictions = RNNModel->Predict(Inputs);
+
+        cout << "Input: ";
+        for (size_t i = 0; i < inputValues.size(); ++i) {
+            if (i > 0) cout << ", ";
+            cout << fixed << setprecision(4) << inputValues[i];
+        }
+        cout << "\n";
+
+        if (!Predictions.empty() && !Predictions.back().empty()) {
+            cout << "Output: ";
+            for (size_t i = 0; i < Predictions.back().size(); ++i) {
+                if (i > 0) cout << ", ";
+                cout << fixed << setprecision(6) << Predictions.back()[i];
+            }
+            cout << "\n";
+
+            if (Predictions.back().size() > 1) {
+                size_t maxIdx = 0;
+                for (size_t i = 1; i < Predictions.back().size(); ++i) {
+                    if (Predictions.back()[i] > Predictions.back()[maxIdx]) {
+                        maxIdx = i;
+                    }
+                }
+                cout << "Max index: " << maxIdx << "\n";
             }
         }
 
-        if (!Quiet)
-            cout << "Training complete." << endl;
+        delete RNNModel;
+    }
+    else if (Command == cmdInfo) {
+        if (modelFile.empty()) { cerr << "Error: --model is required\n"; return 1; }
+        cout << "Loading model from JSON: " << modelFile << "\n";
+        TAdvancedRNN* RNNModel = new TAdvancedRNN(1, {1}, 1, ctLSTM, atTanh, atLinear, ltMSE, 0.01, 5.0, 0);
+        RNNModel->LoadModelFromJSON(modelFile);
+        
+        ifstream file(modelFile);
+        stringstream buffer;
+        buffer << file.rdbuf();
+        string Content = buffer.str();
+        file.close();
+        
+        cout << "Model Information:\n";
+        cout << "  Input size: " << ExtractJSONValue(Content, "input_size") << "\n";
+        cout << "  Output size: " << ExtractJSONValue(Content, "output_size") << "\n";
+        cout << "  Hidden sizes: " << ExtractJSONValue(Content, "hidden_sizes") << "\n";
+        cout << "  Cell type: " << ExtractJSONValue(Content, "cell_type") << "\n";
+        cout << "  Activation: " << ExtractJSONValue(Content, "activation") << "\n";
+        cout << "  Output activation: " << ExtractJSONValue(Content, "output_activation") << "\n";
+        cout << "  Loss type: " << ExtractJSONValue(Content, "loss_type") << "\n";
+        cout << "  Learning rate: " << ExtractJSONValue(Content, "learning_rate") << "\n";
+        cout << "  Gradient clip: " << ExtractJSONValue(Content, "gradient_clip") << "\n";
+        cout << "  BPTT steps: " << ExtractJSONValue(Content, "bptt_steps") << "\n";
 
-        delete RNN;
+        delete RNNModel;
     }
 
     return 0;
