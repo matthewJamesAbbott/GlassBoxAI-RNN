@@ -1,0 +1,26 @@
+[package]
+name = "facaded_rnn_cuda"
+version = "0.1.0"
+edition = "2021"
+authors = ["Matthew Abbott"]
+license = "MIT"
+description = "Facaded CUDA-accelerated RNN implementation using cudarc"
+
+[dependencies]
+cudarc = { version = "0.12", features = ["driver", "nvrtc", "cuda-version-from-build-system"] }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+
+[[bin]]
+name = "facaded_rnn"
+path = "src/main.rs"
+
+[lib]
+name = "facaded_rnn_cuda"
+path = "src/main.rs"
+crate-type = ["lib"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

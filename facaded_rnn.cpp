@@ -1019,6 +1019,9 @@ void PrintUsage() {
     std::cout << "Query Options (Facade Functions):\n";
     std::cout << "  --model=FILE.json      Load model from JSON file (required)\n";
     std::cout << "  --query-type=TYPE      Query type (required)\n";
+    std::cout << "                         Valid types: input-size, output-size, hidden-size,\n";
+    std::cout << "                                      cell-type, sequence-length, dropout-rate,\n";
+    std::cout << "                                      hidden-state\n";
     std::cout << "  --layer=N              Layer index\n";
     std::cout << "  --timestep=N           Timestep index\n";
     std::cout << "  --neuron=N             Neuron index\n";

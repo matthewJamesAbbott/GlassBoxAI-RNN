@@ -1405,6 +1405,8 @@ public:
         std::cout << "Model loaded from JSON: " << Filename << "\n";
     }
 
+    int GetInputSize() const { return FInputSize; }
+    int GetOutputSize() const { return FOutputSize; }
     int GetLayerCount() const { return FHiddenSizes.size(); }
     int GetHiddenSize(int LayerIdx) const {
         if (LayerIdx >= 0 && LayerIdx < (int)FHiddenSizes.size())
@@ -1576,6 +1578,9 @@ void PrintUsage() {
     std::cout << "Query Options (Facade Functions):\n";
     std::cout << "  --model=FILE.json      Load model from JSON file (required)\n";
     std::cout << "  --query-type=TYPE      Query type (required)\n";
+    std::cout << "                         Valid types: input-size, output-size, hidden-size,\n";
+    std::cout << "                                      cell-type, sequence-length, dropout-rate,\n";
+    std::cout << "                                      hidden-state\n";
     std::cout << "  --layer=N              Layer index\n";
     std::cout << "  --timestep=N           Timestep index\n";
     std::cout << "  --neuron=N             Neuron index\n";
@@ -1861,7 +1866,11 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Executing query: " << queryType << "\n\n";
 
-        if (queryType == "hidden-size") {
+        if (queryType == "input-size") {
+            std::cout << "Input size: " << RNN->GetInputSize() << "\n";
+        } else if (queryType == "output-size") {
+            std::cout << "Output size: " << RNN->GetOutputSize() << "\n";
+        } else if (queryType == "hidden-size") {
             std::cout << "Hidden size (layer " << layer << "): " << RNN->GetHiddenSize(layer) << "\n";
         } else if (queryType == "cell-type") {
             std::cout << "Cell type: " << CellTypeToStr(RNN->GetCellType()) << "\n";
